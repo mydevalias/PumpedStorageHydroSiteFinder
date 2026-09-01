@@ -84,9 +84,10 @@ Flow-rate ceiling: MW isn't derivable from head/volume alone — that also
 needs a flow rate (penstock/turbine sizing we don't model), and naively
 assuming the whole volume discharges over DESIGN_DISCHARGE_HOURS implies
 *some* flow rate, however large. A candidate found this session needed
-1970 m3/s to do that — 9x the flow of Romania's actual flagship
-pumped-storage project (the planned Tarnița–Lăpuștești, 1000MW). volumes.
-realistic_power_mw() caps the flow at MAX_FLOW_RATE_M3_S (calibrated
+1970 m3/s to do that (under the DESIGN_DISCHARGE_HOURS=8 in effect then,
+since corrected to 13 — see volumes.py) — 9x the flow of Romania's actual
+flagship pumped-storage project (the planned Tarnița–Lăpuștești, 1000MW).
+volumes.realistic_power_mw() caps the flow at MAX_FLOW_RATE_M3_S (calibrated
 against three real plants — see its docstring) instead: large-volume
 candidates just take longer than DESIGN_DISCHARGE_HOURS to fully cycle,
 rather than reporting an unbuildable instantaneous power. flow_limited and
@@ -110,6 +111,7 @@ from rasterio.merge import merge
 from scipy.ndimage import minimum_filter
 from shapely.geometry import LineString
 
+from contours import CONTOUR_INTERVAL_M, generate_contours
 from fetch_data import DATA_DIR, LAKES_OUT_PATH, dem_tile_path, fetch_hydrolakes_raw
 from volumes import (
     DESIGN_DISCHARGE_HOURS,
@@ -216,12 +218,18 @@ def tiles_for_window(min_lon, min_lat, max_lon, max_lat) -> list[Path]:
     return sorted(tiles)
 
 
-def best_new_site(lake_lon: float, lake_lat: float, lake_elev: float, lake_volume_m3: float | None,
-                   mode: SearchMode) -> dict | None:
-    m_per_deg_lon, m_per_deg_lat = meters_per_degree(lake_lat)
-    d_lon = SEARCH_RADIUS_M / m_per_deg_lon
-    d_lat = SEARCH_RADIUS_M / m_per_deg_lat
-    window = (lake_lon - d_lon, lake_lat - d_lat, lake_lon + d_lon, lake_lat + d_lat)
+def load_elevation_window(center_lon: float, center_lat: float, radius_m: float):
+    """Reads and merges just enough cached DEM tiles to cover a radius_m square around
+    (center_lon, center_lat). Returns (elev, valid, transform, lon_1d, lat_1d) — the 1D
+    axis arrays are the natural coordinates for a regular grid (what contourpy and the
+    meshgrid-based searches both want), or None if no tiles cover this point at all.
+    Shared by best_new_site() (the search) and contours.py (drawing what's already there)
+    so both read the DEM the same way.
+    """
+    m_per_deg_lon, m_per_deg_lat = meters_per_degree(center_lat)
+    d_lon = radius_m / m_per_deg_lon
+    d_lat = radius_m / m_per_deg_lat
+    window = (center_lon - d_lon, center_lat - d_lat, center_lon + d_lon, center_lat + d_lat)
 
     tile_paths = tiles_for_window(*window)
     if not tile_paths:
@@ -242,6 +250,17 @@ def best_new_site(lake_lon: float, lake_lat: float, lake_elev: float, lake_volum
     rows = np.arange(height)
     lon_1d = transform.c + (cols + 0.5) * transform.a
     lat_1d = transform.f + (rows + 0.5) * transform.e
+    return elev, valid, transform, lon_1d, lat_1d
+
+
+def best_new_site(lake_lon: float, lake_lat: float, lake_elev: float, lake_volume_m3: float | None,
+                   mode: SearchMode) -> dict | None:
+    m_per_deg_lon, m_per_deg_lat = meters_per_degree(lake_lat)
+
+    window = load_elevation_window(lake_lon, lake_lat, SEARCH_RADIUS_M)
+    if window is None:
+        return None
+    elev, valid, transform, lon_1d, lat_1d = window
     lon_grid, lat_grid = np.meshgrid(lon_1d, lat_1d)
 
     dx_m = (lon_grid - lake_lon) * m_per_deg_lon
@@ -441,6 +460,29 @@ def to_geodataframe(rows: list[dict]) -> gpd.GeoDataFrame:
     )
 
 
+def contours_geodataframe(top_candidates: list[dict]) -> gpd.GeoDataFrame:
+    """Elevation contour lines for the search window around each of the given (already-
+    ranked, top-N) candidates — reloads the DEM window per candidate (cheap: cached
+    tiles, no network) rather than threading contour data through the whole search,
+    since only a handful of candidates ever need this, not every lake scanned."""
+    properties = []
+    geometries = []
+    for rank, r in enumerate(top_candidates, start=1):
+        window = load_elevation_window(r["lake_lon"], r["lake_lat"], SEARCH_RADIUS_M)
+        if window is None:
+            continue
+        elev, valid, _transform, lon_1d, lat_1d = window
+        for line in generate_contours(lon_1d, lat_1d, elev, valid):
+            properties.append({
+                "rank": rank,
+                "lake_id": r["lake_id"],
+                "elevation_m": line["elevation_m"],
+            })
+            geometries.append(LineString(line["coordinates"]))
+
+    return gpd.GeoDataFrame(properties, geometry=geometries, crs="EPSG:4326")
+
+
 def main() -> None:
     lakes = gpd.read_file(LAKES_OUT_PATH)
     docs_dir = Path(__file__).resolve().parent.parent / "docs"
@@ -466,6 +508,12 @@ def main() -> None:
         top_path = docs_dir / f"candidates_{mode.name}.geojson"
         to_geodataframe(top).to_file(top_path, driver="GeoJSON")
         print(f"  wrote {top_path} (top {len(top)})")
+
+        contours = contours_geodataframe(top)
+        contours_path = docs_dir / f"contours_{mode.name}.geojson"
+        contours.to_file(contours_path, driver="GeoJSON")
+        print(f"  wrote {contours_path} ({len(contours)} contour segments, "
+              f"{CONTOUR_INTERVAL_M}m interval)")
 
         for i, r in enumerate(top, start=1):
             confidence = "bounded" if r["basin_bounded"] else "may extend further — search-limited"

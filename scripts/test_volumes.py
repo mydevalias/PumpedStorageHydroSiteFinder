@@ -52,6 +52,7 @@ from volumes import (
     power_from_flow_mw,
     realistic_power_mw,
     usable_cycling_volume_m3,
+    DESIGN_DISCHARGE_HOURS,
     MAX_BASIN_CELLS,
     MAX_FLOW_RATE_M3_S,
 )
@@ -179,7 +180,7 @@ class TestStoragePower(unittest.TestCase):
 
     def test_power_is_energy_over_design_hours(self):
         mwh = storage_capacity_mwh(head_m=200, volume_m3=5_000_000)
-        self.assertAlmostEqual(estimated_power_mw(mwh), mwh / 8)
+        self.assertAlmostEqual(estimated_power_mw(mwh), mwh / DESIGN_DISCHARGE_HOURS)
 
     def test_zero_volume_is_zero_everything(self):
         self.assertEqual(storage_capacity_mwh(head_m=500, volume_m3=0), 0.0)
@@ -202,6 +203,21 @@ class TestRealisticPower(unittest.TestCase):
         predicted = power_from_flow_mw(flow_m3_s=80, head_m=809)
         self.assertAlmostEqual(predicted, 510, delta=40)
 
+    def test_design_discharge_hours_matches_tarnita_lapustesti_duration(self):
+        # Regression test for a real reasoning error made and corrected this session:
+        # DESIGN_DISCHARGE_HOURS was originally 8, on the (backwards) claim that a
+        # shorter duration was "conservative". It's not — MW = MWh / duration, so a
+        # shorter duration always means a LARGER MW for the same energy, never smaller.
+        # Checked directly against the one real duration figure available: Tarnița–
+        # Lăpuștești's own 10M m3 @ 563.5m head = 13047 MWh, at its real 1000MW rating
+        # that's 13.0h — not 8h. Using 8h would have reported 1631MW for that same real
+        # site, 1.63x its actual rating. This pins the corrected value down so it can't
+        # silently drift back to something shorter (and higher) without a test failing.
+        real_mwh = storage_capacity_mwh(head_m=563.5, volume_m3=10_000_000)
+        real_implied_duration_h = real_mwh / 1000
+        self.assertAlmostEqual(real_implied_duration_h, 13.0, delta=0.2)
+        self.assertAlmostEqual(DESIGN_DISCHARGE_HOURS, real_implied_duration_h, delta=1)
+
     def test_max_flow_rate_matches_tarnita_lapustesti(self):
         # The planned 1000MW/563.5m Tarnița–Lăpuștești project implies ~213 m3/s — the
         # basis for MAX_FLOW_RATE_M3_S (250, rounded up for headroom).
@@ -210,9 +226,10 @@ class TestRealisticPower(unittest.TestCase):
         self.assertGreater(MAX_FLOW_RATE_M3_S, implied_real_flow)  # headroom, not a tight fit
 
     def test_uncapped_for_a_reasonably_sized_candidate(self):
-        # A candidate whose 8h flow requirement is comfortably under the ceiling should score
-        # exactly like the naive duration-based estimate — the cap shouldn't touch it.
-        volume_m3, head_m = 5_000_000, 300  # implies ~174 m3/s, under the 250 ceiling
+        # A candidate whose flow requirement (at DESIGN_DISCHARGE_HOURS) is comfortably
+        # under the ceiling should score exactly like the naive duration-based estimate —
+        # the cap shouldn't touch it.
+        volume_m3, head_m = 5_000_000, 300  # implies ~107 m3/s at 13h, under the 250 ceiling
         mwh = storage_capacity_mwh(head_m, volume_m3)
         power_mw, flow, flow_limited = realistic_power_mw(mwh, head_m, volume_m3)
         self.assertFalse(flow_limited)

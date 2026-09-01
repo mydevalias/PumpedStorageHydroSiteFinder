@@ -24,13 +24,23 @@ ROUND_TRIP_EFFICIENCY = 0.85  # typical for pumped hydro; approximate
 
 # Power (MW) isn't derivable from head/volume alone — that also needs a flow rate, which
 # depends on penstock/turbine sizing we don't model. Standard back-of-envelope approach:
-# assume the reservoir discharges over a fixed duration, so MW = MWh / hours. 8h is a
-# commonly-cited typical full-load duration for utility-scale pumped storage. For
-# comparison, the real Lăpuștești reservoir (10M m3 @ 563.5m head) implies ~13h at its
-# rated 1000MW — so 8h is if anything conservative (produces a lower MW estimate, not an
-# inflated one) for a similarly-sized real site. Because this is a constant divisor, it
-# rescales storage_mwh but never changes the ranking order between candidates.
-DESIGN_DISCHARGE_HOURS = 8
+# assume the reservoir discharges over a fixed duration, so MW = MWh / hours.
+#
+# CORRECTED 2026-09-01: this was 8, on the reasoning "8h is conservative — a shorter
+# duration than the real Lăpuștești's ~13h, so it'd underestimate MW". That reasoning was
+# backwards: MW = MWh / duration, so a SHORTER duration divides by a smaller number and
+# gives a LARGER MW, not a smaller one. Checked directly: real Lăpuștești is 10M m3 @
+# 563.5m head = 13047 MWh; at the real 1000MW rating that's a 13.0h duration. Using 8h
+# instead would have reported 1631MW for that same real site — 1.63x its actual rating,
+# before any flow-rate cap even applies. 13 is the one real duration figure we have for a
+# Romanian pumped-storage design; use it rather than a shorter, unjustified guess. Because
+# this is a constant divisor, it rescales storage_mwh but never changes the ranking order
+# between candidates — MAX_FLOW_RATE_M3_S (calibrated independently, see below) is
+# unaffected by this change, though which candidates trigger it shifts (a longer duration
+# means a given volume implies a smaller flow, so fewer candidates hit the cap; the ones
+# that don't are still reduced directly by the smaller MWh/duration ratio, so both effects
+# push non-capped candidates' MW down, not up).
+DESIGN_DISCHARGE_HOURS = 13
 
 
 def basin_volume(elev: np.ndarray, valid: np.ndarray, seed_row: int, seed_col: int,
@@ -121,7 +131,10 @@ def estimated_power_mw(storage_mwh: float) -> float:
 # a big modern multi-unit design, vs. 80-90 m3/s for the single/few-unit older plants),
 # rounded up for headroom: the ceiling on what a single realistic project's waterway can
 # carry, checked in-session against a candidate that otherwise reported ~5700MW at 1970
-# m3/s — 9x Tarnița–Lăpuștești's own flow, and not something any single project could build.
+# m3/s (under the DESIGN_DISCHARGE_HOURS=8 in effect at the time; see that constant's
+# history above) — 9x Tarnița–Lăpuștești's own flow, not something any single project
+# could build. This ceiling is independent of DESIGN_DISCHARGE_HOURS (it comes straight
+# from real Q, H, MW figures) and needed no change when that constant was corrected.
 MAX_FLOW_RATE_M3_S = 250
 
 
@@ -139,7 +152,8 @@ def power_from_flow_mw(flow_m3_s: float, head_m: float) -> float:
 def realistic_power_mw(storage_mwh: float, head_m: float, volume_m3: float) -> tuple[float, float, bool]:
     """estimated_power_mw() alone assumes you can build a waterway big enough to move the
     whole volume in DESIGN_DISCHARGE_HOURS, however large that requires the flow to be —
-    caught this session on a candidate demanding 1970 m3/s (see MAX_FLOW_RATE_M3_S comment).
+    caught this session on a candidate demanding 1970 m3/s (see MAX_FLOW_RATE_M3_S comment;
+    that figure was under the since-corrected DESIGN_DISCHARGE_HOURS=8).
     This caps the flow at MAX_FLOW_RATE_M3_S instead: a large-volume candidate just takes
     longer than DESIGN_DISCHARGE_HOURS to fully cycle, rather than reporting an unbuildable
     instantaneous power figure. Small-volume candidates are never affected — their required
