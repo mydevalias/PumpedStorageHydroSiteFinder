@@ -1,6 +1,6 @@
 {
 "type": "FeatureCollection",
-"name": "candidates_natural_all",
+"name": "candidates_natural",
 "crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } },
 "features": [
 { "type": "Feature", "properties": { "type": "lake-new", "rank": 1, "lake_id": 1357337, "lake_elevation_m": 649.5, "new_site_elevation_m": 841.7, "head_m": 192.2, "distance_m": 1813.3, "direction": "higher", "volume_million_m3": 6.75, "basin_volume_million_m3": 6.75, "empirical_volume_million_m3": 5.303, "lake_volume_million_m3": 17.5, "limited_by_existing_lake": false, "surface_area_km2": 0.2704, "storage_mwh": 3004.5, "estimated_mw": 231.1, "score": 231.1122, "implied_flow_m3_s": 144.2, "flow_limited": false, "basin_bounded": true, "wall_fraction": null, "dam_start_lon": 23.905051, "dam_start_lat": 45.724335, "dam_end_lon": 23.906036, "dam_end_lat": 45.725995, "dam_height_m": 59.6, "dam_length_m": 200.0, "concrete_volume_m3": 266775.0 }, "geometry": { "type": "LineString", "coordinates": [ [ 23.920447483056421, 45.712633056640925 ], [ 23.905543604077348, 45.725164747062934 ] ] } },

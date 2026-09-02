@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Pumped-Storage Hydro Site Finder — Romania</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  html, body { height: 100%; margin: 0; font-family: system-ui, sans-serif; }
+  #map { height: 100%; }
+  .legend {
+    background: white;
+    padding: 8px 12px;
+    border-radius: 4px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+    font-size: 13px;
+    line-height: 1.6;
+    max-width: 260px;
+  }
+  .legend h4 { margin: 0 0 6px; font-size: 13px; }
+  .legend .swatch { display: inline-block; width: 20px; height: 3px; margin-right: 6px; vertical-align: middle; }
+  .legend .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .popup-table td { padding: 1px 6px 1px 0; }
+  .popup-table td:first-child { color: #555; }
+  .mw-label {
+    background: rgba(255,255,255,0.92);
+    border-radius: 3px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+    font-size: 11px;
+    line-height: 1.35;
+    padding: 2px 6px;
+    white-space: nowrap;
+    text-align: center;
+    transform: translate(-50%, -50%);
+  }
+  .mw-label .headline { font-weight: 700; font-size: 12px; }
+  .mw-label .detail { color: #444; }
+  .lake-label { transform: translate(-50%, 65%); }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map = L.map('map').setView([45.9, 25.0], 7);
+
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 17,
+  attribution: '&copy; OpenStreetMap contributors'
+}).addTo(map);
+
+// Each mode gets a fixed color (not a score gradient) — natural and engineered candidates
+// aren't on the same volume scale, so a shared gradient would make natural sites look
+// uniformly "worst". Rank still shown via line weight (rank 1 thickest) and the popup.
+const MODES = [
+  { key: 'natural', file: 'candidates_natural.geojson', contourFile: 'contours_natural.geojson',
+    basinFile: 'basins_natural.geojson',
+    color: '#2563eb', dash: null, label: 'Natural / plateau depression (as-is)' },
+  { key: 'engineered', file: 'candidates_engineered.geojson', contourFile: 'contours_engineered.geojson',
+    basinFile: 'basins_engineered.geojson',
+    color: '#ea580c', dash: '8 6', label: 'Engineered (dam built across a valley)' },
+];
+const REFERENCE_COLOR = '#16a34a';
+const CONTOUR_COLOR = '#a3742f';
+const CONTOUR_INTERVAL_M = 50;  // mirrors contours.CONTOUR_INTERVAL_M (scripts/contours.py)
+const CONTOUR_INDEX_EVERY = 5;  // every 5th contour (250m) drawn bolder — standard topo-map convention
+// Mirrors volumes.MAX_FLOW_RATE_M3_S (scripts/volumes.py) — a single project's realistic
+// waterway capacity, calibrated against real Vidraru/Lotru-Ciunget/Tarnița-Lăpuștești figures.
+const MAX_FLOW_RATE_M3_S = 250;
+// Mirrors volumes.DESIGN_DISCHARGE_HOURS — the real Tarnița-Lăpuștești duration
+// (10M m3 @ 563.5m head / 1000MW = 13.0h), not a shorter, unjustified guess.
+const DESIGN_DISCHARGE_HOURS = 13;
+// Mirrors find_sites.MIN_WALL_FRACTION — ENGINEERED's containment gate (see
+// basin_wall_fraction()'s docstring in find_sites.py; raised 0.5 -> 0.6 after a user
+// checked a 0.50 candidate on real satellite imagery and found a dam site sitting on a
+// mountain edge, not a valley — 0.54 turned out to be the highest wall_fraction
+// achievable anywhere near that lake, meaning 0.5 let through lakes with no real site
+// at all). Every ENGINEERED candidate here already cleared this, but the winners still
+// cluster tightly at the threshold rather than comfortably above it (MW-maximizing
+// search favors the loosest passing basin, whatever the threshold is) — that's why
+// wall_fraction itself is shown, not just a pass/fail badge; "passed" means "not
+// obviously fake," not "confidently real."
+const MIN_WALL_FRACTION = 0.6;
+
+function googleMapsLink(lat, lon) {
+  return `<a href="https://www.google.com/maps?q=${lat},${lon}" target="_blank" rel="noopener">${lat.toFixed(5)}, ${lon.toFixed(5)} &#8599;</a>`;
+}
+
+// Where to point the Google Maps link: the site itself — the seed basin_volume() flood-
+// fills from, always inside its own basin footprint polygon (verified this session).
+// Used to prefer the dam line's midpoint when one existed; the dam line's no longer
+// shown on the map (see below), so this now always points at the lake instead.
+//
+// For NATURAL this reads as "the middle of the new lake" almost exactly — checked this
+// session, the seed sits within 0-153m of its own basin's centroid on the current top
+// candidates (small next to a ~1.2km basin). For ENGINEERED it deliberately does NOT:
+// the seed is the dam location, and a dam sits at the low/downstream EDGE of its
+// reservoir by design, not the middle — checked the same way, 362-795m from centroid
+// on a 1.5-4km basin (up to a third of its own diagonal). Both are correct, on-terrain
+// coordinates (not a stray approximation) — they're just answering different questions
+// ("where's the water" vs "where would you actually build"). See linkLabel below,
+// which is worded per-mode for exactly this reason rather than always saying "lake".
+function linkCoords(p, siteLat, siteLon) {
+  return [siteLat, siteLon];
+}
+
+function popupHtml(p, modeLabel, siteLat, siteLon) {
+  // basin_bounded=True means the flood grew until it needed a taller dam than this
+  // mode allows — NOT that it found where the terrain naturally closes (checked
+  // directly this session: basin_bounded candidates sit within ~2m of the height
+  // cap essentially every time). It's a real, full figure at that height, just not
+  // proof the true rim is right there rather than higher up.
+  const confidenceNote = p.basin_bounded
+    ? `full basin at the max dam height this mode allows (real figure, not a search-limited guess — but the true topographic rim could be higher still)`
+    : 'search-limited — cut off by the search radius/compute budget before reaching either a rim or the max dam height; true basin may be bigger than shown';
+  const lakeVolumeRow = p.lake_volume_million_m3 != null
+    ? `${p.lake_volume_million_m3} million m&sup3; (HydroLAKES)`
+    : 'unknown — not validated against it';
+  const usableVolumeRow = p.limited_by_existing_lake
+    ? `${p.volume_million_m3} million m&sup3; — <strong>capped by the existing lake</strong> (basin could hold ${p.basin_volume_million_m3})`
+    : `${p.volume_million_m3} million m&sup3; (existing lake isn't the limit)`;
+  const flowRow = p.flow_limited
+    ? `<strong>capped at ${MAX_FLOW_RATE_M3_S} m&sup3;/s</strong> — full ${DESIGN_DISCHARGE_HOURS}h discharge would need ${p.implied_flow_m3_s} m&sup3;/s, no real single project moves that much water`
+    : `${p.implied_flow_m3_s} m&sup3;/s over ${DESIGN_DISCHARGE_HOURS}h — within a realistic single-project range`;
+  const concreteRow = p.concrete_volume_m3 != null
+    ? `~${(p.concrete_volume_m3 / 1e6).toFixed(2)} million m&sup3; (gravity-dam estimate: ${p.dam_height_m}m tall &times; ${p.dam_length_m}m long — crude; dam not drawn on the map, see legend)`
+    : 'no real dam axis found here (terrain doesn\'t clearly rise on both sides) — no estimate';
+  // wall_fraction is null for NATURAL (bowl_required already guarantees containment a
+  // different way). For ENGINEERED, this candidate passed >= MIN_WALL_FRACTION, but
+  // "passed" isn't the same as "comfortably contained" — see the const's own comment.
+  const wallRow = p.wall_fraction != null
+    ? `${Math.round(p.wall_fraction * 100)}% of the basin's own boundary is real terrain wall (>=${Math.round(MIN_WALL_FRACTION * 100)}% required to pass) — the rest is either this mode's own search-radius edge, or the open end a real dam's downstream side is expected to have`
+    : 'not applicable — natural/plateau depressions are required to be a real local minimum before search, a different containment guarantee';
+  const [linkLat, linkLon] = linkCoords(p, siteLat, siteLon);
+  // ENGINEERED's pin is the dam location, not the lake's middle — see linkCoords'
+  // comment. isEngineered reuses the same wall_fraction != null signal as wallRow
+  // below (null only for NATURAL) rather than threading the mode key through.
+  const isEngineered = p.wall_fraction != null;
+  const linkLabel = isEngineered ? 'Dam site on Google Maps' : 'New lake on Google Maps';
+  const linkNote = isEngineered
+    ? ' (the low/downstream edge of the basin, where the dam would go — not the middle of the new lake, see the shaded shape for that)'
+    : '';
+  return `
+    <strong>#${p.rank} — ${modeLabel}</strong>
+    <table class="popup-table">
+      <tr><td><strong>Est. power</strong></td><td><strong>${Math.round(p.estimated_mw).toLocaleString()} MW</strong></td></tr>
+      <tr><td>Lake ID</td><td>${p.lake_id}</td></tr>
+      <tr><td>Lake elevation</td><td>${p.lake_elevation_m} m</td></tr>
+      <tr><td>Existing lake volume</td><td>${lakeVolumeRow}</td></tr>
+      <tr><td>New site elevation</td><td>${p.new_site_elevation_m} m</td></tr>
+      <tr><td>${linkLabel}</td><td>${googleMapsLink(linkLat, linkLon)}${linkNote}</td></tr>
+      <tr><td>Concrete estimate</td><td>${concreteRow}</td></tr>
+      <tr><td>Direction</td><td>new site is ${p.direction}</td></tr>
+      <tr><td>Head</td><td>${p.head_m} m</td></tr>
+      <tr><td>Distance</td><td>${p.distance_m} m</td></tr>
+      <tr><td>Usable volume</td><td>${usableVolumeRow}</td></tr>
+      <tr><td>Basin surface</td><td>${p.surface_area_km2} km&sup2; (shaded shape on the map is the real footprint)</td></tr>
+      <tr><td>Cross-check (statistical)</td><td>${p.empirical_volume_million_m3} million m&sup3; — independent estimate from real reservoirs' area&rarr;volume, not our terrain model (loose floor, not precise)</td></tr>
+      <tr><td>Required flow</td><td>${flowRow}</td></tr>
+      <tr><td>Est. storage</td><td>${Math.round(p.storage_mwh).toLocaleString()} MWh @ ${DESIGN_DISCHARGE_HOURS}h</td></tr>
+      <tr><td>Volume confidence</td><td>${confidenceNote}</td></tr>
+      <tr><td>Containment check</td><td>${wallRow}</td></tr>
+    </table>
+  `;
+}
+
+const overlays = {};
+const allBounds = [];
+
+const modesPromise = Promise.all(
+  MODES.map(mode => Promise.all([
+    fetch(mode.file).then(res => res.json()),
+    fetch(mode.contourFile).then(res => res.json()).catch(() => ({ features: [] })),
+    fetch(mode.basinFile).then(res => res.json()).catch(() => ({ features: [] })),
+  ]).then(([data, contourData, basinData]) => ({ mode, data, contourData, basinData })))
+);
+const referencePromise = fetch('reference_projects.geojson')
+  .then(res => res.json())
+  .catch(() => ({ features: [] }));
+
+Promise.all([modesPromise, referencePromise]).then(([results, referenceData]) => {
+  let anyFeatures = false;
+
+  results.forEach(({ mode, data, contourData, basinData }) => {
+    const group = L.featureGroup();
+    const features = data.features || [];
+    anyFeatures = anyFeatures || features.length > 0;
+
+    // Contours first, so candidate lines/markers draw on top of them, not under.
+    (contourData.features || []).forEach(cf => {
+      const cp = cf.properties;
+      const isIndex = Math.round(cp.elevation_m / CONTOUR_INTERVAL_M) % CONTOUR_INDEX_EVERY === 0;
+      const latlngs = cf.geometry.coordinates.map(([lon, lat]) => [lat, lon]);
+      L.polyline(latlngs, {
+        color: CONTOUR_COLOR,
+        weight: isIndex ? 1.5 : 0.75,
+        opacity: isIndex ? 0.7 : 0.4,
+      }).bindPopup(`${Math.round(cp.elevation_m)}m contour`).addTo(group);
+    });
+
+    // Basin footprints next (still under the candidate lines/markers) — the ACTUAL
+    // flooded shape from basin_volume(), not a circle or other stand-in for "how big".
+    const basinByRank = new Map((basinData.features || []).map(bf => [bf.properties.rank, bf]));
+    basinByRank.forEach((bf, rank) => {
+      L.geoJSON(bf, {
+        style: { color: mode.color, weight: 2, opacity: 0.9, fillColor: mode.color, fillOpacity: 0.55 },
+      }).bindPopup(`New lake footprint (rank #${rank}, ${mode.label})<br>as computed by the flood-fill — the real shape, not an approximation`).addTo(group);
+    });
+
+    features.forEach(f => {
+      const p = f.properties;
+      const weight = Math.max(2, 6 - p.rank);
+      const [lakeCoord, siteCoord] = f.geometry.coordinates;
+      const [lakeLon, lakeLat] = lakeCoord;
+      const [siteLon, siteLat] = siteCoord;
+      const html = popupHtml(p, mode.label, siteLat, siteLon);
+
+      const midLat = (lakeLat + siteLat) / 2;
+      const midLon = (lakeLon + siteLon) / 2;
+
+      L.polyline([[lakeLat, lakeLon], [siteLat, siteLon]], {
+        color: mode.color, weight, opacity: 0.85, dashArray: mode.dash
+      }).bindPopup(html).addTo(group);
+
+      // Permanent on-map label — headline numbers shouldn't require a click to see.
+      // basin_volume_million_m3 is the new site's own estimate (what the bowl/basin
+      // itself is reckoned to hold); volume_million_m3 is that capped by the existing
+      // lake's own volume when it's the smaller of the two (see popup for details) —
+      // show both when they differ, so the cap is visible without a click.
+      const estimateLine = `${p.basin_volume_million_m3}M m&sup3; est. &middot; ${Math.round(p.head_m)}m head &middot; ${Math.round(p.distance_m)}m away`;
+      const usableLine = p.limited_by_existing_lake
+        ? `<div class="detail">&rarr; ${p.volume_million_m3}M m&sup3; usable (lake-limited)</div>`
+        : '';
+      L.marker([midLat, midLon], {
+        icon: L.divIcon({
+          className: 'mw-label',
+          html: `<div class="headline">#${p.rank} · ${Math.round(p.estimated_mw).toLocaleString()} MW</div>` +
+                `<div class="detail">${estimateLine}</div>` + usableLine,
+          iconSize: null,
+        }),
+        interactive: false,
+      }).addTo(group);
+
+      const lakeVolumeText = p.lake_volume_million_m3 != null
+        ? `${p.lake_volume_million_m3}M m&sup3;`
+        : 'volume unknown';
+
+      L.circleMarker([lakeLat, lakeLon], {
+        radius: 6, color: mode.color, fillColor: mode.color, fillOpacity: 0.9, weight: 2
+      }).bindPopup(
+        `Existing lake ${p.lake_id}<br>elevation ${p.lake_elevation_m} m<br>` +
+        `volume ${lakeVolumeText} (HydroLAKES)`
+      ).addTo(group);
+
+      // Existing-lake volume, labeled right on the lake itself — this is the hard cap on
+      // how much water the new site can ever cycle, so it needs to be as visible as the
+      // new site's own numbers, not just mentioned in a popup.
+      L.marker([lakeLat, lakeLon], {
+        icon: L.divIcon({
+          className: 'mw-label lake-label',
+          html: `<div class="detail">lake: ${lakeVolumeText}</div>`,
+          iconSize: null,
+        }),
+        interactive: false,
+      }).addTo(group);
+
+      // For ENGINEERED this dot is the dam location (the basin's downstream edge, not
+      // its middle — see linkCoords' comment); label it as such rather than "site",
+      // which reads as the lake's location and isn't for this mode.
+      const siteMarkerLabel = mode.key === 'engineered' ? 'Dam site' : 'New reservoir site';
+      L.circleMarker([siteLat, siteLon], {
+        radius: 6, color: mode.color, fillColor: 'white', fillOpacity: 0.9, weight: 2
+      }).bindPopup(
+        `${siteMarkerLabel} (rank #${p.rank}, ${mode.label})<br>elevation ${p.new_site_elevation_m} m<br>` +
+        googleMapsLink(siteLat, siteLon)
+      ).addTo(group);
+
+      allBounds.push([lakeLat, lakeLon], [siteLat, siteLon]);
+      // Dam line intentionally not drawn on the map for now, per user request ("I feel
+      // like showing the lake is superior") — the basin footprint polygon (below) is
+      // the primary "what will it look like" visual instead. Note this ISN'T because
+      // the dam axis is unreliable: after the containment-filter fix, ENGINEERED's
+      // dam axis is found for 20/20 of the current top list (NATURAL, which doesn't
+      // require one, sits at 12/20) — it's a visual preference, not an accuracy
+      // workaround. The underlying dam_start/dam_end and concrete_volume_m3 fields are
+      // unchanged in the geojson if this gets revisited.
+    });
+
+    group.addTo(map);
+    overlays[`${mode.label} (${features.length})`] = group;
+  });
+
+  // Real, published project(s) — a visual benchmark for judging whether our own
+  // candidates are in a plausible range, not something our algorithm found.
+  const referenceGroup = L.featureGroup();
+  (referenceData.features || []).forEach(f => {
+    const rp = f.properties;
+    const [[lakeLon, lakeLat], [siteLon, siteLat]] = f.geometry.coordinates;
+    const midLat = (lakeLat + siteLat) / 2;
+    const midLon = (lakeLon + siteLon) / 2;
+
+    const popupHtml = `
+      <strong>${rp.name}</strong> — real, published project (${rp.status})
+      <table class="popup-table">
+        <tr><td><strong>Rated power</strong></td><td><strong>${rp.rated_mw.toLocaleString()} MW</strong></td></tr>
+        <tr><td>Lake elevation</td><td>${rp.lake_elevation_m} m</td></tr>
+        <tr><td>New site elevation</td><td>${rp.new_site_elevation_m} m (site location approximate — see source)</td></tr>
+        <tr><td>New site on Google Maps</td><td>${googleMapsLink(siteLat, siteLon)} (approximate — see source)</td></tr>
+        <tr><td>Head</td><td>${rp.head_m} m</td></tr>
+        <tr><td>Distance</td><td>${rp.distance_m} m</td></tr>
+        <tr><td>Upper reservoir (cycling)</td><td>${rp.volume_million_m3} million m&sup3;</td></tr>
+        <tr><td>Lower reservoir (cycling)</td><td>${rp.lake_volume_million_m3} million m&sup3;</td></tr>
+        <tr><td>Implied duration</td><td>${rp.implied_duration_h} h (storage energy &divide; rated MW, our formula)</td></tr>
+        <tr><td>Source</td><td>${rp.source}</td></tr>
+      </table>
+    `;
+
+    L.polyline([[lakeLat, lakeLon], [siteLat, siteLon]], {
+      color: REFERENCE_COLOR, weight: 4, opacity: 0.9,
+    }).bindPopup(popupHtml).addTo(referenceGroup);
+
+    L.marker([midLat, midLon], {
+      icon: L.divIcon({
+        className: 'mw-label',
+        html: `<div class="headline">REAL: ${rp.rated_mw.toLocaleString()} MW</div>` +
+              `<div class="detail">${rp.volume_million_m3}M m&sup3; &middot; ${rp.head_m}m head &middot; ${rp.status}</div>`,
+        iconSize: null,
+      }),
+      interactive: false,
+    }).addTo(referenceGroup);
+
+    [[lakeLat, lakeLon, `Lake (existing) — ${rp.name}`],
+     [siteLat, siteLon, `New site (real, planned) — ${rp.name}<br>site location approximate — see source`]]
+      .forEach(([lat, lon, label]) => {
+        L.circleMarker([lat, lon], {
+          radius: 7, color: REFERENCE_COLOR, fillColor: REFERENCE_COLOR, fillOpacity: 0.9, weight: 2,
+        }).bindPopup(`${label}<br>${googleMapsLink(lat, lon)}`).addTo(referenceGroup);
+      });
+
+    allBounds.push([lakeLat, lakeLon], [siteLat, siteLon]);
+  });
+  referenceGroup.addTo(map);
+  if ((referenceData.features || []).length > 0) {
+    overlays[`Real project (reference, ${referenceData.features.length})`] = referenceGroup;
+  }
+
+  if (!anyFeatures) {
+    document.getElementById('map').insertAdjacentHTML(
+      'afterbegin',
+      '<div style="position:absolute;top:10px;left:50px;z-index:1000;background:white;padding:8px;">No candidates found.</div>'
+    );
+    return;
+  }
+
+  if (allBounds.length > 0) {
+    map.fitBounds(L.latLngBounds(allBounds).pad(0.3));
+  }
+
+  L.control.layers(null, overlays, { collapsed: false, position: 'topright' }).addTo(map);
+
+  const legend = L.control({ position: 'bottomright' });
+  legend.onAdd = () => {
+    const div = L.DomUtil.create('div', 'legend');
+    div.innerHTML = `
+      <h4>Case B: lake &rarr; new site</h4>
+      <span class="swatch" style="background:${MODES[0].color}; opacity:0.55"></span> natural/plateau depression — a genuine local low point, checked over as wide an area as the flood itself can grow into; usually broad and gently-sloping (a plateau), not a steep-walled mountain bowl. Filled shape is the new lake's real footprint (from the flood-fill, not a stand-in)<br>
+      <span class="swatch" style="background:${MODES[1].color}; opacity:0.55"></span> engineered (build a dam) — same, filled shape is the real footprint<br>
+      <span class="swatch" style="background:${CONTOUR_COLOR}"></span> elevation contours (${CONTOUR_INTERVAL_M}m interval, bold every ${CONTOUR_INTERVAL_M * CONTOUR_INDEX_EVERY}m — click a line for its elevation)<br>
+      <span class="swatch" style="background:${REFERENCE_COLOR}"></span> real, published project (e.g. Tarnița–Lăpuștești) — a benchmark, not one of our candidates<br>
+      <span class="dot" style="background:#999"></span> filled dot = existing lake, hollow dot = new site (for engineered, this is the dam location — the basin's downstream edge, not the middle of the new lake; for natural/plateau it's the bowl's own bottom, close to the middle)<br>
+      <span style="color:#555">thicker line = better rank (1st/2nd/3rd). Mid-line label: rank, estimated power (MW — capped so the required water flow never exceeds ${MAX_FLOW_RATE_M3_S} m&sup3;/s, a real single-project ceiling — see popup), the new site's own estimated volume (basin/bowl), head, distance from the existing lake — plus a second line if the volume is capped down by the existing lake. Small label under each lake: that lake's own volume (HydroLAKES) — the hard cap on how much water the new site can ever cycle, regardless of how big its basin could physically be. Dam location isn't drawn on the map for now (see popup for a crude concrete-volume estimate where one was found) — the shaded lake footprint is the more trustworthy visual.</span>
+    `;
+    return div;
+  };
+  legend.addTo(map);
+}).catch(err => {
+  console.error('Failed to load candidates', err);
+});
+</script>
+</body>
+</html>
