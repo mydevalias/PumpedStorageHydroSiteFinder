@@ -82,7 +82,7 @@ class TestBasinVolumeSynthetic(unittest.TestCase):
         ])
         valid = np.ones_like(elev, dtype=bool)
 
-        volume_m3, surface_area_m2, water_level_m, pour_point = basin_volume(
+        volume_m3, surface_area_m2, water_level_m, pour_point, _visited = basin_volume(
             elev, valid, seed_row=1, seed_col=1,
             pixel_dx_m=10.0, pixel_dy_m=10.0,
             max_dam_height_m=20.0, max_basin_radius_m=1000.0,
@@ -106,7 +106,7 @@ class TestBasinVolumeSynthetic(unittest.TestCase):
         ])
         valid = np.ones_like(elev, dtype=bool)
 
-        volume_m3, surface_area_m2, water_level_m, pour_point = basin_volume(
+        volume_m3, surface_area_m2, water_level_m, pour_point, _visited = basin_volume(
             elev, valid, seed_row=1, seed_col=1,
             pixel_dx_m=10.0, pixel_dy_m=10.0,
             max_dam_height_m=5.0, max_basin_radius_m=1000.0,
@@ -132,7 +132,7 @@ class TestBasinVolumeSynthetic(unittest.TestCase):
         valid = np.ones_like(elev, dtype=bool)
         seed_row = 10  # elevation 50 here; rows 11-19 are all LOWER (downhill)
 
-        volume_m3, surface_area_m2, water_level_m, pour_point = basin_volume(
+        volume_m3, surface_area_m2, water_level_m, pour_point, _visited = basin_volume(
             elev, valid, seed_row=seed_row, seed_col=2,
             pixel_dx_m=10.0, pixel_dy_m=10.0,
             max_dam_height_m=1000.0, max_basin_radius_m=100_000.0,  # deliberately generous
@@ -157,7 +157,7 @@ class TestBasinVolumeSynthetic(unittest.TestCase):
 
         valid = np.ones_like(elev, dtype=bool)
 
-        volume_m3, surface_area_m2, water_level_m, pour_point = basin_volume(
+        volume_m3, surface_area_m2, water_level_m, pour_point, _visited = basin_volume(
             elev, valid, seed_row=0, seed_col=size // 2,
             pixel_dx_m=30.0, pixel_dy_m=30.0,
             max_dam_height_m=1000.0, max_basin_radius_m=100_000.0,
@@ -347,13 +347,18 @@ class TestBasinVolumeRealWorld(unittest.TestCase):
     Tarnița-Lăpuștești project (~1000MW, 563.5m head, Lăpuștești reservoir on a
     *plateau* at 1085m — see DATA_SOURCES.md).
 
-    Coordinates below are Lake Tarnița's centroid from data/lakes.geojson (HydroLAKES),
-    elevation 515.0m — close to the real published NNR level of 521.5m
-    (ro.wikipedia.org/wiki/Lacul_Tarni%C8%9Ba), confirming this is the right lake.
+    Coordinates below are Lake Tarnița's anchor point from data/lakes.geojson —
+    geometry.representative_point(), not .centroid (fetch_data.py switched this
+    session: centroid can land outside a non-convex polygon entirely, confirmed on
+    101 of 1100 Romania lakes, one of which — id=1293, a curving Danube reservoir —
+    centroided to a hillside 500m higher than the actual water; see
+    TestAnchorPointFix below). Elevation there is 515.0m — close to the real published
+    NNR level of 521.5m (ro.wikipedia.org/wiki/Lacul_Tarni%C8%9Ba), confirming this is
+    the right lake.
     """
 
-    LON = 23.278707869648212
-    LAT = 46.721549912777185
+    LON = 23.277492752515492
+    LAT = 46.72019978841189
     ELEV_M = 515.0
     # HydroLAKES' own Vol_total for this lake (data/lakes.geojson, id=169355) — matches
     # the independently published >70M m3 (ro.wikipedia.org/wiki/Lacul_Tarni%C8%9Ba)
@@ -403,7 +408,7 @@ class TestBasinVolumeRealWorld(unittest.TestCase):
         elev, valid, pixel_dx_m, pixel_dy_m = self._load_window(find_sites.ENGINEERED)
         peak_row, peak_col = np.unravel_index(np.argmax(np.where(valid, elev, -np.inf)), elev.shape)
 
-        volume_m3, surface_area_m2, water_level_m, pour_point = basin_volume(
+        volume_m3, surface_area_m2, water_level_m, pour_point, _visited = basin_volume(
             elev, valid, peak_row, peak_col, pixel_dx_m, pixel_dy_m,
             max_dam_height_m=find_sites.ENGINEERED.max_dam_height_m,
             max_basin_radius_m=find_sites.ENGINEERED.max_basin_radius_m,
@@ -411,31 +416,47 @@ class TestBasinVolumeRealWorld(unittest.TestCase):
 
         self.assertLess(volume_m3, 10_000)  # near-zero, not a real reservoir
 
-    def test_valley_seed_near_tarnita_gives_a_plausible_volume(self):
-        # Sanity/regression check with real terrain: a genuine valley-style search near
-        # Tarnița should land somewhere physically reasonable — bounded above by what
-        # MAX_BASIN_CELLS/max_dam_height_m can produce, and comfortably below the
-        # billion-m^3 territory the pre-fix bug produced.
+    def test_tarnita_correctly_finds_no_engineered_candidate(self):
+        # Checked directly this session (2026-09-02) after raising MIN_WALL_FRACTION to
+        # 0.6: Tarnița's best achievable wall_fraction anywhere in its whole 2km search
+        # window is 0.598 — just under the gate. Consistent with the real world (see
+        # test_seeding_at_the_plateau_peak_finds_almost_no_water's docstring): the real
+        # Lăpuștești project is plateau diking, not a valley dam, so ENGINEERED
+        # correctly has nothing to offer here. A companion, positive-case regression
+        # test for that same real fact, from the other direction.
         result = find_sites.best_new_site(
             self.LON, self.LAT, self.ELEV_M, self.LAKE_VOLUME_M3, find_sites.ENGINEERED
         )
+        self.assertIsNone(result)
+
+    def test_valley_seed_near_a_real_lake_gives_a_plausible_volume(self):
+        # Same sanity/regression check the Tarnița-based version of this test used to do
+        # (bounded above by what MAX_BASIN_CELLS/max_dam_height_m can produce, comfortably
+        # below the billion-m^3 territory the pre-fix bug produced) — moved to a
+        # different real lake once Tarnița itself started correctly returning None (see
+        # test_tarnita_correctly_finds_no_engineered_candidate above). Lake 1360316: its
+        # best achievable wall_fraction (0.683) clears MIN_WALL_FRACTION with real margin,
+        # unlike Tarnița's 0.598 — chosen for that reason, not arbitrarily.
+        lon, lat, elev_m, lake_volume_m3 = 22.459219129732748, 44.937792400784815, 231.0, 15_800_000.0
+        result = find_sites.best_new_site(lon, lat, elev_m, lake_volume_m3, find_sites.ENGINEERED)
         self.assertIsNotNone(result)
         self.assertGreater(result["volume_m3"], find_sites.MIN_VOLUME_M3)
         self.assertLess(result["volume_m3"], 500_000_000)  # well below the pre-fix bug's scale
         self.assertGreater(result["head_m"], find_sites.MIN_HEAD_M)
         # usable volume can never exceed either reservoir, including the anchor lake's own.
-        self.assertLessEqual(result["volume_m3"], self.LAKE_VOLUME_M3)
+        self.assertLessEqual(result["volume_m3"], lake_volume_m3)
+        self.assertGreaterEqual(result["wall_fraction"], find_sites.MIN_WALL_FRACTION)
 
     def test_tiny_anchor_lake_caps_a_much_bigger_basin(self):
-        # Same search, but claiming Tarnița only holds 1M m3 (it really holds ~74M) — the
-        # usable volume must drop to that cap, while the basin's own physical size
-        # (basin_volume_m3) stays whatever the terrain actually supports.
-        result = find_sites.best_new_site(
-            self.LON, self.LAT, self.ELEV_M, 1_000_000, find_sites.ENGINEERED
-        )
+        # Same search (lake 1360316, see above), but claiming it only holds 300K m3 (it
+        # really holds ~15.8M) — the usable volume must drop to that cap, while the
+        # basin's own physical size (basin_volume_m3) stays whatever the terrain
+        # actually supports. 300K stays comfortably below any plausible real basin here.
+        lon, lat, elev_m = 22.459219129732748, 44.937792400784815, 231.0
+        result = find_sites.best_new_site(lon, lat, elev_m, 300_000, find_sites.ENGINEERED)
         self.assertIsNotNone(result)
-        self.assertEqual(result["volume_m3"], 1_000_000)
-        self.assertGreater(result["basin_volume_m3"], 1_000_000)
+        self.assertEqual(result["volume_m3"], 300_000)
+        self.assertGreater(result["basin_volume_m3"], 300_000)
         self.assertTrue(result["limited_by_existing_lake"])
 
     def test_fetched_lake_volume_matches_published_value(self):
@@ -452,6 +473,51 @@ class TestBasinVolumeRealWorld(unittest.TestCase):
         volume_m3 = match.iloc[0]["volume_m3"]
         self.assertAlmostEqual(volume_m3, self.LAKE_VOLUME_M3, delta=1)
         self.assertGreaterEqual(volume_m3, 70_000_000)  # the published lower bound
+
+
+@unittest.skipUnless(
+    fetch_data.LAKES_OUT_PATH.exists(), "requires data/lakes.geojson — run fetch_data.py first"
+)
+class TestAnchorPointFix(unittest.TestCase):
+    """fetch_data.py used geometry.centroid for each lake's anchor point — a polygon's
+    center of MASS, which for a non-convex shape isn't guaranteed to fall inside the
+    polygon at all. Checked directly this session: 101 of Romania's 1100 lakes have a
+    centroid outside their own polygon. The worst case found, id=1293 (a large, curving
+    Danube-valley reservoir — real name likely Porțile de Fier I / Iron Gate I, bounds
+    matching it closely): centroid landed on a hillside, sampling 566.2m elevation —
+    500m higher than the water. Switched to geometry.representative_point(), which
+    shapely guarantees falls inside the polygon.
+    """
+
+    LAKE_ID = 1293
+
+    def test_anchor_point_is_inside_the_real_polygon(self):
+        import geopandas as gpd
+        import fetch_data as fd
+
+        boundary = fd.fetch_country_boundary()
+        shp_path = fd.LAKES_RAW_DIR / "HydroLAKES_polys_v10_shp" / "HydroLAKES_polys_v10.shp"
+        if not shp_path.exists():
+            self.skipTest("requires the cached HydroLAKES shapefile — run fetch_data.py first")
+        raw = gpd.read_file(shp_path, mask=boundary, where=f"Hylak_id = {self.LAKE_ID}")
+        self.assertEqual(len(raw), 1)
+        polygon = raw.iloc[0].geometry
+
+        self.assertFalse(polygon.contains(polygon.centroid), "test fixture assumption broke: "
+                          "centroid is now inside the polygon, this lake no longer demonstrates the bug")
+        self.assertTrue(polygon.contains(polygon.representative_point()))
+
+    def test_fetched_elevation_is_plausible_for_a_danube_valley_reservoir(self):
+        # Not a Danube-valley elevation check by coincidence — id=1293's polygon bounds
+        # (21.7-22.5 E, 44.4-44.7 N) match the real Porțile de Fier I / Iron Gate I
+        # reservoir on the Romania-Serbia border closely enough to be confident this is
+        # it, and that stretch of the Danube sits at well under 100m elevation.
+        import geopandas as gpd
+        lakes = gpd.read_file(fetch_data.LAKES_OUT_PATH)
+        match = lakes[lakes["id"] == self.LAKE_ID]
+        self.assertEqual(len(match), 1)
+        elevation = match.iloc[0]["elevation"]
+        self.assertLess(elevation, 150)  # the old centroid bug sampled 566.2m here
 
 
 if __name__ == "__main__":

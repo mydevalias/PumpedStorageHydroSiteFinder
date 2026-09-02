@@ -3,3 +3,4 @@ geopandas
 shapely
 rasterio
 scipy
+contourpy

@@ -1,5 +1,5 @@
 """Part 1 (data layer): download DEM tiles, country boundary, and lake polygons,
-then produce data/lakes.geojson (id, centroid, elevation, area, volume).
+then produce data/lakes.geojson (id, anchor point, elevation, area, volume).
 
 To reuse for a different country, edit the CONFIG block below (COUNTRY_NAME,
 COUNTRY_ISO_A3, BBOX) and re-run. See ../DATA_SOURCES.md for details on each
@@ -150,7 +150,13 @@ def build_lakes_geojson(boundary: gpd.GeoSeries) -> None:
     lakes = gpd.read_file(shp_path, mask=boundary)
     print(f"  {len(lakes)} lakes found")
 
-    centroids = lakes.geometry.centroid
+    # NOT geometry.centroid: that's the polygon's center of mass, which for a
+    # non-convex shape (a long curving reservoir, an irregular natural lake) can land
+    # outside the polygon entirely — checked directly this session: 101 of 1100 lakes
+    # here do exactly that (e.g. id=1293, a large Danube-valley reservoir, centroids to
+    # a point ~500m higher in elevation than the actual lake, on a hillside nowhere near
+    # the water). representative_point() is guaranteed to fall inside the polygon.
+    anchor_points = lakes.geometry.representative_point()
     # Vol_total is HydroLAKES' own volume estimate (Messager et al. 2016, a geostatistical
     # model — not derived from our DEM), in million m^3; 0 means "unknown", not "empty lake".
     volume_m3 = (lakes["Vol_total"] * 1_000_000).where(lakes["Vol_total"] > 0)
@@ -158,10 +164,10 @@ def build_lakes_geojson(boundary: gpd.GeoSeries) -> None:
         {
             "id": lakes["Hylak_id"],
             "area_km2": lakes["Lake_area"],
-            "elevation": [sample_elevation(pt.x, pt.y) for pt in centroids],
+            "elevation": [sample_elevation(pt.x, pt.y) for pt in anchor_points],
             "volume_m3": volume_m3,
         },
-        geometry=centroids,
+        geometry=anchor_points,
         crs=lakes.crs,
     )
 

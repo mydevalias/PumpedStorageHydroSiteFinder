@@ -14,9 +14,18 @@ import numpy as np
 
 # ---- CONFIG ------------------------------------------------------------
 
-MAX_BASIN_CELLS = 4000  # hard cap on cells per flood-fill (~3.6km^2 at 30m res) — a compute
-                          # guard independent of max_basin_radius_m/max_dam_height_m: gentle
-                          # terrain can fill a huge fraction of even a bounded search window
+MAX_BASIN_CELLS = 12000  # hard cap on cells per flood-fill (~8km^2 at typical Romania-latitude
+                           # pixel size) — a compute guard independent of max_basin_radius_m/
+                           # max_dam_height_m: gentle terrain can fill a huge fraction of even
+                           # a bounded search window. Raised from 4000 this session — that
+                           # tighter cap was cutting the flood off (basin_bounded=False, i.e.
+                           # volume_m3 an underestimate, not a confident figure) for a lot of
+                           # ENGINEERED candidates specifically (11/20 in the top-20 at the
+                           # time) — the flood often hadn't even reached max_dam_height_m yet
+                           # within the old cell budget, let alone whatever lies past it. This
+                           # doesn't change the *algorithm*, which is already the standard one
+                           # for exactly this problem (priority-flood / watershed depression-
+                           # filling) — it just lets it run further before giving up.
 
 WATER_DENSITY_KG_M3 = 1000
 GRAVITY_M_S2 = 9.81
@@ -45,7 +54,7 @@ DESIGN_DISCHARGE_HOURS = 13
 
 def basin_volume(elev: np.ndarray, valid: np.ndarray, seed_row: int, seed_col: int,
                   pixel_dx_m: float, pixel_dy_m: float, max_dam_height_m: float,
-                  max_basin_radius_m: float) -> tuple[float, float, float, tuple | None]:
+                  max_basin_radius_m: float) -> tuple[float, float, float, tuple | None, np.ndarray]:
     """Priority-flood outward from (seed_row, seed_col) — the dam site — never going
     below the seed's own elevation (that's downstream of the dam, not in the
     reservoir), raising the water level only as far as the surrounding terrain
@@ -53,9 +62,22 @@ def basin_volume(elev: np.ndarray, valid: np.ndarray, seed_row: int, seed_col: i
     laterally, and MAX_BASIN_CELLS as a hard compute guard (real terrain rarely
     encloses a basin within the first two bounds alone — a gentle slope can run for
     kilometers before rising 100m, and MAX_BASIN_CELLS exists for exactly that case).
-    Returns (volume_m3, surface_area_m2, water_level_m,
-    pour_point) where pour_point is (row, col) of the natural rim the flood stopped
-    at, or None if the flood instead ran out of search window/cell budget first.
+    Returns (volume_m3, surface_area_m2, water_level_m, pour_point, visited) where
+    pour_point is (row, col) of the first cell that would have needed a taller dam
+    than max_dam_height_m to include (or None if the flood instead ran out of search
+    window/cell budget first, without ever reaching that height). Checked directly
+    against the full search output this session: essentially every candidate with
+    pour_point set has water_level within ~2m of seed_elev + max_dam_height_m — i.e.
+    in practice this almost always means "hit our own height budget," not "the
+    terrain genuinely closed here." The algorithm has no way to tell those two
+    apart: real terrain rarely encloses a basin below max_dam_height at all (see
+    above), so when it does stop there, that could equally be a true small rim
+    just past the cap, or an open slope that would have kept climbing indefinitely
+    if allowed to. Don't read pour_point-is-not-None as "confident, natural rim
+    found" — see find_sites.py's basin_bounded for how this is actually surfaced.
+    visited is the boolean mask (elev's shape) of every cell included in the basin —
+    the actual flooded footprint, e.g. for turning into a polygon with
+    rasterio.features.shapes().
     """
     height, width = elev.shape
     seed_elev = elev[seed_row, seed_col]
@@ -97,12 +119,12 @@ def basin_volume(elev: np.ndarray, valid: np.ndarray, seed_row: int, seed_col: i
             heapq.heappush(heap, (elev[nr, nc], nr, nc))
 
     if not basin_cells:
-        return 0.0, 0.0, seed_elev, None
+        return 0.0, 0.0, seed_elev, None, visited
 
     cell_elevs = np.array(basin_cells)
     volume_m3 = float(np.sum(water_level - cell_elevs)) * pixel_area_m2
     surface_area_m2 = len(basin_cells) * pixel_area_m2
-    return volume_m3, surface_area_m2, water_level, pour_point
+    return volume_m3, surface_area_m2, water_level, pour_point, visited
 
 
 def storage_capacity_mwh(head_m: float, volume_m3: float) -> float:
