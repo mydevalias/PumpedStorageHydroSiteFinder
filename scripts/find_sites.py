@@ -121,6 +121,7 @@ data/dem/. Writes, per mode:
 """
 
 import math
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -128,7 +129,7 @@ import geopandas as gpd
 import numpy as np
 import rasterio
 from rasterio.merge import merge
-from scipy.ndimage import distance_transform_edt, minimum_filter
+from scipy.ndimage import distance_transform_edt, minimum_filter, uniform_filter
 from rasterio.features import geometry_mask, shapes as rasterio_shapes
 from shapely.geometry import LineString
 from shapely.geometry import shape as shapely_shape
@@ -151,8 +152,14 @@ from volumes import (
 # ---- CONFIG ------------------------------------------------------------
 
 SEARCH_RADIUS_M = 2000  # how far around each lake to look for a new site (the CANDIDATE
-                          # filter, distance_grid <= SEARCH_RADIUS_M — not the loaded DEM
-                          # window, see search_window_radius_m() below)
+                          # filter — not the loaded DEM window, see SEARCH_WINDOW_RADIUS_M
+                          # below). This is ENGINEERED's own radius (via SearchMode's
+                          # seed_radius_m default) and PLATEAU/NATURAL's fallback constant
+                          # for anything that isn't itself mode-aware (contours_geodataframe's
+                          # default) — NATURAL overrides its own seed_radius_m to 2500,
+                          # PLATEAU has its own separate PLATEAU_SEARCH_RADIUS_M entirely.
+                          # See best_new_site(), which reads mode.seed_radius_m, not this
+                          # constant directly.
 # Real bug found this session: a candidate right at the edge of SEARCH_RADIUS_M sits right
 # at the edge of the loaded DEM array too, if the array is only loaded out to that same
 # radius. minimum_filter's bowl check (mode="nearest") then pads past the array edge by
@@ -208,18 +215,110 @@ LAKE_EXCLUSION_BUFFER_M = 500.0  # how far beyond the lake's real shoreline (not
 MIN_HEAD_M = 100  # minimum elevation difference to be worth building
 MAX_SLOPE_GRADE = 1.0  # reject candidates on implausibly steep ground (100% grade / 45deg)
 MIN_VOLUME_M3 = 100_000  # below this, treat the site as "no real basin", not a candidate
-TOP_N = 20
+TOP_N = {  # 20 -> 100 -> 20 (user's calls, 2026-09-02/03): raised for a broader look
+            # while the display filters below didn't exist yet; lowered back once
+            # MIN_DISPLAY_MW/MIN_VOLUME_RATIO_TO_LAKE were doing the real filtering
+            # work and "top 20 per mode" was the more useful, comparable-across-modes
+            # shape again. contours_geodataframe/basin_footprints_geodataframe both
+            # scale with this (one DEM reload + basin_volume() rerun per candidate).
+            # Split per-mode (2026-09-03, later same day): after PLATEAU_SEARCH_RADIUS_M
+            # and the ratio-floor drop let far more real PLATEAU candidates qualify
+            # nationally, Leșu (a real, previously user-verified candidate — see the
+            # 2026-09-03 Leșu entries above) fell to raw rank 42, just past the top-20
+            # cutoff. User's call (AskUserQuestion): raise PLATEAU's own TOP_N to 50 so
+            # candidates like it stay visible. NATURAL raised to 50 too, same day, for
+            # consistency across modes — it only has 5 raw candidates total (see
+            # run_mode()'s own print), so this is a no-op on what's actually displayed
+            # right now, not a meaningful loosening; kept as a dict rather than folded
+            # back into one shared constant since ENGINEERED (96 raw candidates) still
+            # has real headroom for the cap to matter, unlike NATURAL.
+    "natural": 50,
+    "engineered": 20,
+    "plateau": 50,
+}
+MIN_DISPLAY_MW = {  # user's call (2026-09-03): don't show a project this small — a
+                     # display-only floor, applied after ranking so it doesn't change
+                     # which candidate wins for a given lake, just whether the map/
+                     # docs/candidates_<mode>.geojson bothers showing it. The full,
+                     # unfiltered ranking still goes to data/candidates_<mode>_all.
+                     # geojson (internal reference, not published) — nothing here
+                     # changes what best_new_site()/best_plateau_site() themselves
+                     # consider a valid candidate, only what gets drawn.
+                     # Split per-mode (2026-09-03, same day): "for natural allow a
+                     # smaller mw given it is cheaper to build" — NATURAL needs no dam/
+                     # embankment at all (bowl_required already guarantees containment),
+                     # so a small project is still worth building where ENGINEERED/
+                     # PLATEAU's wall/dike cost means small ones usually aren't. 10MW is
+                     # the widely-used regulatory "small hydro" cutoff (EU, China) —
+                     # below that, treat it as noise; above it, a cheap natural bowl is
+                     # worth showing even at a fraction of ENGINEERED/PLATEAU's floor.
+    "natural": 10,
+    "engineered": 50,
+    "plateau": 50,
+}
+MIN_VOLUME_RATIO_TO_LAKE = {  # user's call (2026-09-03): don't show a project unless
+                     # the new site's own physical capacity (basin_volume_m3, NOT the
+                     # usable/capped volume_m3 — comparing the CAPPED figure against
+                     # the very lake it's capped to would fail by definition for every
+                     # lake-limited candidate, which is most of them) is at least this
+                     # many times the existing lake's own volume. Unknown lake volume
+                     # -> excluded too (can't confirm the ratio, so don't claim it).
+                     # Split per-mode (2026-09-03, same day): "2x-lake volume rati[o],
+                     # if the new lake is smallert that is still good" for NATURAL — a
+                     # natural bowl smaller than the paired lake is still worth showing
+                     # since it costs almost nothing to add (no dam/embankment build);
+                     # the ratio floor stays for ENGINEERED, where a big lake paired
+                     # with a small new reservoir isn't worth the wall cost.
+                     # PLATEAU dropped to 0.0 too (2026-09-03, later same day): after
+                     # widening PLATEAU_SEARCH_RADIUS_M, the algorithm found a genuine
+                     # candidate at real Tarnița (lake 169355) matching the real
+                     # Lăpuștești project closely (11.6M m^3 vs published 10.0M, 1110MW
+                     # vs published ~1000MW, head 538m vs published 563.5m) — but that
+                     # candidate's own ratio is basin_volume_m3 11.6M / lake_volume_m3
+                     # 74.0M = 0.157. Any floor above ~0.157 would exclude PLATEAU's own
+                     # flagship real-world precedent, the exact project this mode is
+                     # grounded in — not a judgment call at that point, the 2.0 bar was
+                     # just wrong for this mode. Real diking cost (unlike NATURAL) is
+                     # still real, but that's what MIN_DISPLAY_MW's 50MW floor already
+                     # screens for; no non-zero ratio value here is better-grounded than
+                     # 0, so matched NATURAL's.
+    "natural": 0.0,
+    "engineered": 2.0,
+    "plateau": 0.0,
+}
 
-MAX_DAM_LENGTH_M = 200  # user's call (2026-09-02): a dam wall longer than this isn't
-                          # practical for a project at this modest scale, everything
-                          # beyond it is "too long to be practical". Also doubles as the
-                          # effective search distance dam_line_endpoints samples for a
-                          # valid crossing — a basin whose real valley is wider than this
-                          # correctly reports "no dam axis found" rather than drawing an
-                          # artificially-shortened, misleading line/estimate for it.
+MAX_DAM_LENGTH_M = 300  # 200 -> 300 (user's call, 2026-09-03): raised after asking for
+                          # real practical grounding rather than a round-number guess.
+                          # Checked two real dams in this same river cascade (see
+                          # DATA_SOURCES.md): Tarnița's own dam is 237m crest length,
+                          # Someșul Cald's is 130m — 300m covers both with real margin.
+                          # Considered capping by concrete volume instead (the user's
+                          # other suggestion) but found no clean, comparable real figure
+                          # to calibrate it against — the one real number available (the
+                          # full Tarnița-Lăpuștești CHEAP scheme's 16,000 m^3 surface +
+                          # 192,000 m^3 underground concrete) covers the WHOLE project
+                          # (tunnels, underground powerhouse, everything), not a wall
+                          # alone, so it's not a like-for-like comparison to
+                          # dam_construction.py's wall-only estimate. Left for later if a
+                          # cleaner reference turns up — not guessed at now. Also doubles
+                          # as the effective search distance dam_line_endpoints samples
+                          # for a valid crossing — a basin whose real valley is wider
+                          # than this correctly reports "no dam axis found" rather than
+                          # drawing an artificially-shortened, misleading line/estimate.
 DAM_LINE_HALF_LENGTH_M = (80, MAX_DAM_LENGTH_M / 2)  # (min, max) half-length — clamp
                                       # for the illustrative dam line drawn on the map;
                                       # not derived from real valley cross-sections
+UNREALISTIC_DAM_PROBE_HALF_M = 1000  # diagnostic-only wide probe (see best_new_site) —
+                                       # tells "no valley shape here at all" apart from
+                                       # "there's a valley, just wider than
+                                       # MAX_DAM_LENGTH_M allows" for a candidate that
+                                       # found no axis at the practical length. 1000m
+                                       # picked to comfortably exceed real large dams
+                                       # (Tarnița's own 237m crest, Someșul Cald's 130m —
+                                       # see DATA_SOURCES.md) without reaching all the
+                                       # way to ENGINEERED's own max_basin_radius_m
+                                       # (2000m), which would just relabel "no valley at
+                                       # all" candidates as "unrealistic" too.
 DAM_LINE_ANGLE_STEPS = 8  # candidate dam-axis orientations tried per site (0-157.5deg,
                            # 22.5deg apart — a line and its 180deg-rotated self are the same line)
 DAM_LINE_MIN_RISE_M = 5  # both ends of the dam axis must be at least this much higher than
@@ -228,6 +327,98 @@ DAM_LINE_MIN_RISE_M = 5  # both ends of the dam axis must be at least this much 
 MIN_WALL_FRACTION = 0.6  # ENGINEERED's containment gate — see basin_wall_fraction()'s
                           # docstring for calibration and its known clustering-at-the-
                           # threshold caveat
+
+# --- PLATEAU mode config ---------------------------------------------------
+# A third category, distinct from both NATURAL and ENGINEERED: a reservoir built by
+# diking the perimeter of genuinely flat/gently-rolling high ground, the way the real
+# Lăpuștești upper reservoir actually is (see reference_projects.py and module
+# docstring) — NOT a natural depression (NATURAL's whole premise) and NOT a single
+# wall across a valley (ENGINEERED's). Every number below is grounded in that one real,
+# citable precedent rather than guessed, since this project has no other real plateau
+# reservoir to calibrate against: "Studiu de Fundamentare — Centrala cu Acumulare prin
+# Pompaj Tarnița-Lăpuștești" (CNSP, 2021), pg. 68-69 — see DATA_SOURCES.md, 2026-09-02,
+# for the full citation and the numbers quoted directly from it.
+PLATEAU_MAX_SLOPE_GRADE = 0.15  # ~8.5deg — must look like genuinely buildable, gently
+                                 # rolling ground, not a hillside. Started at 0.3
+                                 # (~17deg) and tightened after checking real output:
+                                 # that value found a candidate for 29% of a sample of
+                                 # lakes — far more than NATURAL (<1%) or ENGINEERED
+                                 # (~9%) find, which doesn't match how rare a genuine
+                                 # plateau should be. Real Lăpuștești isn't billiard-
+                                 # table flat either (its own footprint has ~34m of
+                                 # natural relief over roughly its own radius — see
+                                 # PLATEAU_MAX_RELIEF_M), just far gentler than
+                                 # MAX_SLOPE_GRADE=1.0 (45deg, ENGINEERED's bar)
+PLATEAU_MAX_RELIEF_M = 40.0  # how far a candidate cell's elevation may differ from the
+                               # seed's and still count as "the same plateau" — matches
+                               # the real embankment height below, not a separate guess
+PLATEAU_EMBANKMENT_HEIGHT_M = 40.0  # design assumption for volume (footprint_area *
+                                      # this — see plateau_footprint()), NOT a natural
+                                      # flood-fill result: a diked plateau pond has no
+                                      # natural water level to speak of. The real
+                                      # Lăpuștești dike is "până la 40 m" (up to 40m) in
+                                      # cross-section — using that exact figure, not a
+                                      # rounder or more convenient number.
+PLATEAU_MAX_RADIUS_M = 450  # real Lăpuștești's own lake surface (388,750 m^2, same
+                              # source) has an equivalent circular radius of ~350m; a
+                              # first pass doubled this to 700m "for search headroom"
+                              # and, combined with the too-loose slope grade above,
+                              # produced footprints of 65-155ha — 2-4x the real
+                              # reference's own 38.9ha. 450m (modest headroom, not 2x)
+                              # keeps candidates in the same ballpark as the one real
+                              # precedent this mode has to calibrate against
+MAX_PLATEAU_CELLS = 12000  # hard compute guard, same role and same value as volumes.
+                             # MAX_BASIN_CELLS — genuinely flat terrain could otherwise
+                             # keep growing a long way before hitting PLATEAU_MAX_RADIUS_M
+PLATEAU_WINDOW_PX = 9  # the flat-window seed check (candidate must be flat over a real
+                         # neighborhood, not just its own pixel) — smaller than NATURAL's
+                         # bowl_window_px=19 deliberately: flatness is a much noisier
+                         # per-pixel DEM signal than "locally lowest," so a window this
+                         # wide already filters effectively without over-shrinking the
+                         # candidate pool the way copying bowl_window_px's size would
+PLATEAU_SEED_STRIDE_PX = 5  # matches ENGINEERED's coarse-grid sampling reasoning — not
+                              # every qualifying pixel needs its own flood-fill
+PLATEAU_MAX_CANDIDATES = 40  # matches ENGINEERED's shortlist cap, same reasoning
+PLATEAU_MIN_FLAT_FRACTION = 0.8  # most of the discovered footprint, not just the seed,
+                                    # must itself be genuinely flat — see
+                                    # plateau_flat_fraction(). Higher than ENGINEERED's
+                                    # MIN_WALL_FRACTION=0.6 deliberately: an ENGINEERED
+                                    # basin legitimately has an open downstream edge by
+                                    # design, but a plateau footprint that's mostly NOT
+                                    # flat isn't a plateau candidate at all, it leaked
+                                    # onto a slope — there's no equivalent "supposed to
+                                    # be open" edge to excuse it here.
+PLATEAU_SEARCH_RADIUS_M = 3000  # own radius, separate from SEARCH_RADIUS_M (user's call,
+                                  # 2026-09-03: "tune the algoritm until it also finds
+                                  # the tarnita lapus naturaly, for plateu searches").
+                                  # SEARCH_RADIUS_M=2000 was calibrated for NATURAL/
+                                  # ENGINEERED, where the new site has to be close enough
+                                  # for a short dam/bowl adjacent to the lake itself — but
+                                  # a diked PLATEAU reservoir sits on high ground that can
+                                  # legitimately be farther out, and 2000m was silently
+                                  # excluding the mode's own real-world precedent. Checked
+                                  # directly against real Tarnița (lake 169355): within
+                                  # 2000m, nothing above 886.5m passes PLATEAU's own
+                                  # flatness test — terrain climbs too steeply close in.
+                                  # Widening the DEM window to 8000m found a genuine,
+                                  # flat_fraction=1.0, 15.8ha plateau at 1007-1034m
+                                  # elevation, 2718-2800m due west of the lake (same
+                                  # latitude as the lake center, matching the real
+                                  # Lăpuștești village's own direction and the CNSP
+                                  # study's "left mountainside adjacent to the
+                                  # reservoir") — head from there (541.8m) lands within
+                                  # 4% of the real published 563.5m. 3000m gives that
+                                  # real cluster (2718-2800m out) comfortable margin
+                                  # without reaching into the unrelated, much taller
+                                  # terrain further out (a different, higher summit
+                                  # cluster starts appearing past ~4900m in a different
+                                  # compass direction — not this same real feature, so
+                                  # deliberately left outside this radius). See
+                                  # DATA_SOURCES.md for the full investigation.
+PLATEAU_SEARCH_WINDOW_RADIUS_M = PLATEAU_SEARCH_RADIUS_M + 400  # same margin-past-the-
+                                  # candidate-cutoff reasoning as SEARCH_WINDOW_RADIUS_M
+                                  # above (untruncated neighborhood for the flatness/
+                                  # slope checks at a candidate near the radius edge)
 
 
 @dataclass(frozen=True)
@@ -240,6 +431,14 @@ class SearchMode:
                               # window matters (see NATURAL below); it's not just a knob
     seed_stride_px: int = 3  # only used when not bowl_required (compute guard)
     max_volume_candidates: int = 50  # flood-fills per lake — the real per-lake compute cap
+    seed_radius_m: float = SEARCH_RADIUS_M  # how far a SEED may sit from the lake (the
+        # base_mask distance filter in best_new_site()) — separate from max_basin_radius_m
+        # (how far the FLOOD may then grow from that seed). Defaults to the shared
+        # SEARCH_RADIUS_M; NATURAL overrides it (see below) after finding a real bowl
+        # just past the shared radius. ENGINEERED deliberately keeps the shared default —
+        # widening it once already surfaced a much bigger, pre-existing containment
+        # problem (see SEARCH_WINDOW_RADIUS_M's docstring above) that a margin tweak can't
+        # fix on its own.
 
 
 NATURAL = SearchMode(
@@ -264,6 +463,20 @@ NATURAL = SearchMode(
     bowl_window_px=19,
     max_dam_height_m=60,
     max_basin_radius_m=500,
+    # 2000 -> 2500 (user's call, 2026-09-03: "i believe near lesu there is a very good
+    # natural spoot"). Checked directly rather than assumed: NATURAL's own bowl test
+    # (local minimum over bowl_window_px=19, ~500m) finds 537 qualifying pixels in the
+    # window around lake 1352457 (Leșu) -- 527 of them sit inside the lake's own
+    # footprint (a lake IS the local minimum of its own basin, expected), and of the 10
+    # real, external ones, every single one sits BEYOND the old SEARCH_RADIUS_M=2000
+    # (2307-3070m out). Ran basin_volume() on the closest/strongest one directly: seed
+    # at 22.54605E/46.81261N, 841m elevation, 2307m from the lake -- a real, POUR-POINT-
+    # BOUNDED (not radius/height-capped) basin holding 12.27M m^3, water level 900.9m,
+    # head 347.4m, ~269MW. A genuine, sizeable natural bowl, just past the old cutoff --
+    # exactly what the user suspected. 2500m gives it clear margin without reaching the
+    # weaker candidates further out (31-119MW, 2408-3070m) that this investigation also
+    # found but didn't specifically motivate widening for.
+    seed_radius_m=2500,
 )
 
 # Calibrated to the real Tarnița dam (97m) and Tarnița lake (2.2km^2, radius ~840m) — see
@@ -302,7 +515,8 @@ def meters_per_degree(lat_deg: float) -> tuple[float, float]:
 def dam_line_endpoints(row: int, col: int, elev: np.ndarray, valid: np.ndarray,
                         pixel_dx_m: float, pixel_dy_m: float, surface_area_m2: float,
                         lon_grid: np.ndarray, lat_grid: np.ndarray,
-                        m_per_deg_lon: float, m_per_deg_lat: float):
+                        m_per_deg_lon: float, m_per_deg_lat: float,
+                        half_length_override_m: float | None = None):
     """A short illustrative line through the seed (the dam site — see basin_volume()'s
     docstring): tries DAM_LINE_ANGLE_STEPS candidate orientations and picks the one
     where the REAL terrain rises on BOTH sides of the seed by at least
@@ -334,12 +548,23 @@ def dam_line_endpoints(row: int, col: int, elev: np.ndarray, valid: np.ndarray,
 
     Length (when an axis is found) is a heuristic guess from the basin's surface area,
     clamped to DAM_LINE_HALF_LENGTH_M — not a real cross-valley survey either way.
+
+    half_length_override_m bypasses that clamp entirely when given — used by
+    best_new_site() for exactly one diagnostic purpose: when the practical (clamped)
+    search finds nothing, try again at a much larger half-length purely to tell "no
+    valley shape here at all" apart from "there's a valley, just wider than
+    MAX_DAM_LENGTH_M allows" (see unrealistic_dam_length_m there). Not used for the
+    real illustrative line/concrete estimate either way — those stay capped at the
+    practical length regardless of what this diagnostic finds.
     """
     height, width = elev.shape
     seed_elev = elev[row, col]
 
-    half_length_m = math.sqrt(surface_area_m2) * 0.5
-    half_length_m = max(DAM_LINE_HALF_LENGTH_M[0], min(DAM_LINE_HALF_LENGTH_M[1], half_length_m))
+    if half_length_override_m is not None:
+        half_length_m = half_length_override_m
+    else:
+        half_length_m = math.sqrt(surface_area_m2) * 0.5
+        half_length_m = max(DAM_LINE_HALF_LENGTH_M[0], min(DAM_LINE_HALF_LENGTH_M[1], half_length_m))
 
     def sample(d_row_m: float, d_col_m: float) -> float | None:
         r = int(round(row + d_row_m / pixel_dy_m))
@@ -475,6 +700,227 @@ def basin_wall_fraction(visited: np.ndarray, elev: np.ndarray, valid: np.ndarray
     return wall_cells / total
 
 
+def plateau_footprint(elev: np.ndarray, valid: np.ndarray, slope: np.ndarray,
+                       seed_row: int, seed_col: int, pixel_dx_m: float, pixel_dy_m: float,
+                       max_relief_m: float, max_radius_m: float) -> tuple[float, np.ndarray]:
+    """How much contiguous, genuinely flat ground actually surrounds a PLATEAU seed —
+    real terrain data, not a flood-fill volume model dressed up as one. A diked plateau
+    reservoir has no natural water level to flood up to (that's the whole point of
+    PLATEAU mode — see its config block above): this is a plain 4-connected BFS, joining
+    a neighbor cell only if its slope stays under PLATEAU_MAX_SLOPE_GRADE and its
+    elevation stays within max_relief_m of the seed (a real plateau isn't billiard-table
+    flat — Lăpuștești's own footprint has real relief across it too, see
+    PLATEAU_MAX_RELIEF_M — but it should be bounded, not the tens-to-hundreds of meters
+    a valley or mountainside would show). Returns (footprint_area_m2, visited boolean
+    mask) — deliberately the same shape of return as basin_volume()'s footprint half, so
+    plateau_footprints_geodataframe() can reuse the same polygon-vectorizing code.
+    """
+    height, width = elev.shape
+    seed_elev = elev[seed_row, seed_col]
+    pixel_area_m2 = pixel_dx_m * pixel_dy_m
+
+    visited = np.zeros_like(valid, dtype=bool)
+    visited[seed_row, seed_col] = True
+    queue = deque([(seed_row, seed_col)])
+    count = 1
+
+    while queue:
+        if count >= MAX_PLATEAU_CELLS:
+            break
+        r, c = queue.popleft()
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < height and 0 <= nc < width) or visited[nr, nc] or not valid[nr, nc]:
+                continue
+            if abs(elev[nr, nc] - seed_elev) > max_relief_m:
+                continue
+            if slope[nr, nc] > PLATEAU_MAX_SLOPE_GRADE:
+                continue
+            dist_m = math.hypot((nr - seed_row) * pixel_dy_m, (nc - seed_col) * pixel_dx_m)
+            if dist_m > max_radius_m:
+                continue
+            visited[nr, nc] = True
+            count += 1
+            queue.append((nr, nc))
+
+    return count * pixel_area_m2, visited
+
+
+def plateau_flat_fraction(visited: np.ndarray, slope: np.ndarray) -> float:
+    """What fraction of a PLATEAU candidate's OWN discovered footprint is genuinely
+    flat (slope <= PLATEAU_MAX_SLOPE_GRADE) — the plateau analog of
+    basin_wall_fraction(), but checking the footprint's OWN interior rather than its
+    boundary, since flatness (not a natural wall) is what makes a plateau candidate
+    real here. Every visited cell already passed this test to be included by
+    plateau_footprint() in the first place, so in principle this should always read
+    1.0 — kept as a real, computed check anyway (not hardcoded to 1.0) so a future
+    change to plateau_footprint()'s own growth rule can't silently stop meaning what
+    this claims it means without this number changing to reveal it.
+    """
+    if not visited.any():
+        return 0.0
+    return float((slope[visited] <= PLATEAU_MAX_SLOPE_GRADE).mean())
+
+
+def best_plateau_site(lake_lon: float, lake_lat: float, lake_elev: float,
+                       lake_volume_m3: float | None, lake_polygon=None) -> dict | None:
+    """PLATEAU's version of best_new_site() — kept as a separate function rather than
+    folded into SearchMode/best_new_site() because the seed test (genuinely flat over a
+    window, not locally lowest or just any qualifying point) and the volume model
+    (footprint_area * a fixed design depth, not basin_volume()'s natural flood-fill
+    integral — see plateau_footprint()) are both different enough that sharing the one
+    function would need more branching than it saves. Reuses the same shared pieces as
+    best_new_site() (load_elevation_window, meters_per_degree, the lake-polygon
+    exclusion logic, storage_capacity_mwh/realistic_power_mw) and returns a dict with
+    the same keys to_geodataframe() already expects — including ones that don't apply
+    here (wall_fraction, unrealistic_dam_length_m, dam_line, concrete_volume_m3, all
+    None; dam_height_m repurposed as the embankment height) so the map/CLI code paths
+    don't need PLATEAU-specific branches downstream.
+    """
+    m_per_deg_lon, m_per_deg_lat = meters_per_degree(lake_lat)
+
+    window = load_elevation_window(lake_lon, lake_lat, PLATEAU_SEARCH_WINDOW_RADIUS_M)
+    if window is None:
+        return None
+    elev, valid, transform, lon_1d, lat_1d = window
+    lon_grid, lat_grid = np.meshgrid(lon_1d, lat_1d)
+
+    dx_m = (lon_grid - lake_lon) * m_per_deg_lon
+    dy_m = (lat_grid - lake_lat) * m_per_deg_lat
+    distance_grid = np.sqrt(dx_m**2 + dy_m**2)
+
+    pixel_dx_m = abs(transform.a) * m_per_deg_lon
+    pixel_dy_m = abs(transform.e) * m_per_deg_lat
+
+    within_lake_mask = compute_within_lake_mask(
+        elev.shape, transform, lake_polygon, distance_grid, pixel_dx_m, pixel_dy_m
+    )
+
+    fill_value = np.nanmax(elev[valid]) + 1.0
+    elev_filled = np.where(valid, elev, fill_value)
+    grad_y, grad_x = np.gradient(elev_filled, pixel_dy_m, pixel_dx_m)
+    slope = np.sqrt(grad_x**2 + grad_y**2)
+
+    head_grid = np.abs(elev - lake_elev)
+
+    base_mask = (
+        valid
+        & ~within_lake_mask
+        & (distance_grid <= PLATEAU_SEARCH_RADIUS_M)
+        & (head_grid >= MIN_HEAD_M)
+        & (slope <= PLATEAU_MAX_SLOPE_GRADE)
+    )
+    # Flat over a real neighborhood, not just the one pixel — the same "check a window,
+    # not a point" idea as NATURAL's bowl_window_px, applied to flatness instead of
+    # elevation minimum. Uses the window's MEAN slope, not maximum_filter's "every
+    # single pixel must pass" — checked against real terrain and found that too brittle:
+    # near Lake Leșu (Bihor), 698 individual pixels passed the per-pixel slope test, but
+    # the all-must-pass window check failed EVERY one of them (0 candidates) — a single
+    # noisy or genuinely-but-narrowly steep DEM cell anywhere in a 9x9 window is enough
+    # to fail it, even on ground that's clearly, broadly flat. The mean-based version
+    # recovered 22 real candidates at that same location. Still real terrain, not DEM
+    # noise being ignored: plateau_footprint()'s own per-cell growth (below) still
+    # requires every individual cell it adds to pass the same strict slope bar, so a
+    # genuinely rough patch inside an otherwise-flat area still correctly stops growth
+    # there — this only relaxes which SEED gets a chance to grow from, not what counts
+    # as flat ground once growing.
+    mean_slope_nearby = uniform_filter(slope, size=PLATEAU_WINDOW_PX, mode="nearest")
+    stride_mask = np.zeros_like(base_mask)
+    stride_mask[::PLATEAU_SEED_STRIDE_PX, ::PLATEAU_SEED_STRIDE_PX] = True
+    candidate_mask = base_mask & (mean_slope_nearby <= PLATEAU_MAX_SLOPE_GRADE) & stride_mask
+
+    if not candidate_mask.any():
+        return None
+
+    prelim_score = np.where(candidate_mask, head_grid / np.maximum(distance_grid, 1.0), -np.inf)
+    candidate_rows, candidate_cols = np.where(candidate_mask)
+    order = np.argsort(prelim_score[candidate_rows, candidate_cols])[::-1]
+    shortlist = list(zip(candidate_rows[order], candidate_cols[order]))[:PLATEAU_MAX_CANDIDATES]
+
+    best = None
+    for row, col in shortlist:
+        footprint_area_m2, visited = plateau_footprint(
+            elev, valid, slope, row, col, pixel_dx_m, pixel_dy_m,
+            PLATEAU_MAX_RELIEF_M, PLATEAU_MAX_RADIUS_M,
+        )
+        basin_volume_m3 = footprint_area_m2 * PLATEAU_EMBANKMENT_HEIGHT_M
+        volume_m3 = usable_cycling_volume_m3(basin_volume_m3, lake_volume_m3)
+        if volume_m3 < MIN_VOLUME_M3:
+            continue
+
+        flat_fraction = plateau_flat_fraction(visited, slope)
+        if flat_fraction < PLATEAU_MIN_FLAT_FRACTION:
+            continue
+
+        # Real bug found this session (2026-09-03): head must be the difference between
+        # the two reservoirs' own WATER SURFACES (that's what actually drives the
+        # turbines), not between the new site's bare ground elevation and the existing
+        # lake's surface. head_grid (used above only for the cheap MIN_HEAD_M
+        # pre-filter/shortlist ranking, where water_level isn't known yet) uses ground
+        # elevation and was leaking into the FINAL reported head_m too — for PLATEAU,
+        # site_elev is the ground under the future embankment, not the pond's own
+        # surface once diked to PLATEAU_EMBANKMENT_HEIGHT_M.
+        site_elev = float(elev[row, col])
+        water_level_m = site_elev + PLATEAU_EMBANKMENT_HEIGHT_M
+        head_m = head_from_water_levels(water_level_m, lake_elev)
+        storage_mwh = storage_capacity_mwh(head_m, volume_m3)
+        power_mw, implied_flow_m3_s, flow_limited = realistic_power_mw(storage_mwh, head_m, volume_m3)
+        if best is None or power_mw > best["score"]:
+            best = {
+                "site_lon": float(lon_grid[row, col]),
+                "site_lat": float(lat_grid[row, col]),
+                "site_elevation_m": site_elev,
+                "head_m": head_m,
+                "distance_m": float(distance_grid[row, col]),
+                "basin_volume_m3": basin_volume_m3,
+                "volume_m3": volume_m3,
+                "lake_volume_m3": lake_volume_m3,
+                # volume_m3 < basin_volume_m3 directly (not re-deriving
+                # MAX_LAKE_DRAWDOWN_FRACTION * lake_volume_m3 here) so this can't drift
+                # out of sync with whatever usable_cycling_volume_m3() actually did.
+                "limited_by_existing_lake": (
+                    lake_volume_m3 is not None and lake_volume_m3 > 0
+                    and volume_m3 < basin_volume_m3
+                ),
+                "surface_area_m2": footprint_area_m2,
+                # Not a natural flood result (there's no water here to flood) — the
+                # design water level implied by diking to PLATEAU_EMBANKMENT_HEIGHT_M.
+                "water_level_m": water_level_m,
+                "wall_fraction": None,  # not applicable — see flat_fraction instead
+                "unrealistic_dam_length_m": None,  # not applicable — see dam_length_m
+                "flat_fraction": flat_fraction,
+                "storage_mwh": storage_mwh,
+                "implied_flow_m3_s": implied_flow_m3_s,
+                "flow_limited": flow_limited,
+                "score": power_mw,
+                "direction": "higher" if site_elev > lake_elev else "lower",
+                "dam_line": None,  # a plateau needs a PERIMETER dike, not a crossing —
+                                     # dam_line_endpoints' whole model doesn't apply
+                                     # (see DATA_SOURCES.md, 2026-09-02, on why the real
+                                     # Lăpuștești's 2715m ring dike isn't comparable to
+                                     # a short valley-dam wall)
+                "dam_height_m": PLATEAU_EMBANKMENT_HEIGHT_M,  # a real design figure
+                                                                 # here (see config block
+                                                                 # above), not a flood
+                                                                 # result like the other
+                                                                 # two modes report
+                "dam_length_m": None,  # would be the visited footprint's own perimeter,
+                                         # not computed (no concrete-volume estimate
+                                         # exists for a ring dike in this project either
+                                         # — dam_construction.py assumes a short wall)
+                "concrete_volume_m3": None,
+                # True (bounded) only if growth stopped for a real reason (relief or
+                # slope) rather than exhausting the radius/cell budget — same
+                # "did we hit our own compute limit vs find a genuine edge" idea as
+                # basin_bounded elsewhere, just checked directly against the footprint's
+                # own extent instead of a pour_point signal (plateau_footprint() has no
+                # equivalent height-cap branch to report one from).
+                "basin_bounded": footprint_area_m2 < math.pi * (PLATEAU_MAX_RADIUS_M ** 2) * 0.85,
+            }
+
+    return best
+
+
 def tiles_for_window(min_lon, min_lat, max_lon, max_lat) -> list[Path]:
     tiles = set()
     for lat in (math.floor(min_lat), math.floor(max_lat)):
@@ -520,11 +966,52 @@ def load_elevation_window(center_lon: float, center_lat: float, radius_m: float)
     return elev, valid, transform, lon_1d, lat_1d
 
 
+def compute_within_lake_mask(elev_shape: tuple, transform, lake_polygon, distance_grid: np.ndarray,
+                              pixel_dx_m: float, pixel_dy_m: float) -> np.ndarray:
+    """Which cells of a loaded window are too close to the existing lake's real
+    shoreline to seed a candidate from — shared by best_new_site() and
+    best_plateau_site() (previously duplicated inline in both). Real bug this replaced
+    (2026-09-02): excluding only a circle around the lake's single anchor point (all
+    lakes.geojson stores) — for a large or elongated lake the anchor can be a kilometer
+    or more from the actual shoreline, letting a candidate seed sit right next to real
+    water while reporting a large, reassuring "distance from lake". Fixed by
+    rasterizing the actual HydroLAKES polygon and measuring true distance to it in real
+    meters (distance_transform_edt, sampled in pixel_dy_m/pixel_dx_m so it isn't
+    distorted by non-square pixels) — falls back to a circle around the window's own
+    center (what distance_grid is already measured from) only if no polygon was found
+    for this lake, which shouldn't normally happen since every lake here comes from the
+    same HydroLAKES source.
+    """
+    if lake_polygon is not None:
+        lake_cell_mask = geometry_mask([lake_polygon], out_shape=elev_shape, transform=transform, invert=True)
+        if lake_cell_mask.any():
+            dist_to_lake_m = distance_transform_edt(~lake_cell_mask, sampling=(pixel_dy_m, pixel_dx_m))
+            return dist_to_lake_m < LAKE_EXCLUSION_BUFFER_M
+    return distance_grid < LAKE_EXCLUSION_BUFFER_M
+
+
+def head_from_water_levels(new_site_water_level_m: float, lake_elev_m: float) -> float:
+    """Head is the difference between the two reservoirs' own WATER SURFACES — see
+    ReadmeAi.md's "How head is calculated" for the full explanation and the real bug
+    (2026-09-03) this function's introduction fixed: head_m used to come from the new
+    site's bare ground elevation instead, understating it by however tall the dam/
+    embankment was (17-31% of head_m on real candidates checked). Pulled out as its own
+    tiny, directly-testable function specifically because that bug was a one-line
+    mistake with an outsized, easy-to-miss effect (MW scales directly with head) — a
+    dedicated test for this one line is cheap insurance against it recurring.
+    """
+    return abs(new_site_water_level_m - lake_elev_m)
+
+
 def best_new_site(lake_lon: float, lake_lat: float, lake_elev: float, lake_volume_m3: float | None,
                    mode: SearchMode, lake_polygon=None) -> dict | None:
     m_per_deg_lon, m_per_deg_lat = meters_per_degree(lake_lat)
 
-    window = load_elevation_window(lake_lon, lake_lat, SEARCH_WINDOW_RADIUS_M)
+    # mode.seed_radius_m + 400, not the flat SEARCH_WINDOW_RADIUS_M — same untruncated-
+    # neighborhood margin (see SEARCH_WINDOW_RADIUS_M's own docstring), but keyed to
+    # this mode's own seed radius so a seed near NATURAL's wider 2500m cutoff still
+    # gets a full, unpadded neighborhood for its bowl/flood checks.
+    window = load_elevation_window(lake_lon, lake_lat, mode.seed_radius_m + 400)
     if window is None:
         return None
     elev, valid, transform, lon_1d, lat_1d = window
@@ -537,35 +1024,14 @@ def best_new_site(lake_lon: float, lake_lat: float, lake_elev: float, lake_volum
     pixel_dx_m = abs(transform.a) * m_per_deg_lon
     pixel_dy_m = abs(transform.e) * m_per_deg_lat
 
-    # Exclude the lake's own footprint. Real bug found this session: this used to be a
-    # circle around just the anchor point (lakes.geojson only stores that, not the real
-    # shape) — for a large or elongated lake (a long reservoir following a valley, the
-    # common case for HydroLAKES reservoirs) the anchor point can be a kilometer or more
-    # from the actual shoreline, so a candidate could sit right next to the real lake
-    # edge — even overlapping the existing dam's own immediate surroundings — while
-    # still reporting a large, reassuring "distance from lake" number measured from that
-    # interior point. Caught concretely: a user-flagged candidate ("#3 ... just below
-    # the existing dam") was reported 1273m away (from the anchor point) but its seed
-    # was actually only 557m from the lake's real polygon edge — and its resulting basin
-    # footprint reached to within 246m, since this buffer only constrains where a flood
-    # can *start*, not how close basin_volume() then lets it *grow* (that's a separate,
-    # deliberately not-yet-made change — flagged, not silently fixed alongside this one,
-    # since capping flood growth near an existing lake is a real algorithm change, not
-    # just a bigger number). Fixed by rasterizing the actual HydroLAKES polygon (already
-    # available, just not previously threaded through this function) and measuring true
-    # distance to it in real meters (scipy's distance_transform_edt, sampling in
-    # pixel_dy_m/pixel_dx_m so it's not distorted by non-square pixels) — falls back to
-    # the old circle only if no polygon was found for this lake (shouldn't normally
-    # happen; every lake here comes from the same HydroLAKES source).
-    if lake_polygon is not None:
-        lake_cell_mask = geometry_mask([lake_polygon], out_shape=elev.shape, transform=transform, invert=True)
-        if lake_cell_mask.any():
-            dist_to_lake_m = distance_transform_edt(~lake_cell_mask, sampling=(pixel_dy_m, pixel_dx_m))
-            within_lake_mask = dist_to_lake_m < LAKE_EXCLUSION_BUFFER_M
-        else:
-            within_lake_mask = distance_grid < LAKE_EXCLUSION_BUFFER_M
-    else:
-        within_lake_mask = distance_grid < LAKE_EXCLUSION_BUFFER_M
+    # Exclude the lake's own footprint — see compute_within_lake_mask()'s docstring for
+    # the real bug this fixed (a user-flagged candidate reported 1273m from the lake by
+    # its anchor point, but only 557m from the real shore) and why a flood can still end
+    # up closer than this buffer once it starts growing (a separate, deliberately
+    # not-yet-made fix).
+    within_lake_mask = compute_within_lake_mask(
+        elev.shape, transform, lake_polygon, distance_grid, pixel_dx_m, pixel_dy_m
+    )
 
     fill_value = np.nanmax(elev[valid]) + 1.0
     elev_filled = np.where(valid, elev, fill_value)
@@ -578,7 +1044,7 @@ def best_new_site(lake_lon: float, lake_lat: float, lake_elev: float, lake_volum
     base_mask = (
         valid
         & ~within_lake_mask
-        & (distance_grid <= SEARCH_RADIUS_M)
+        & (distance_grid <= mode.seed_radius_m)
         & (head_grid >= MIN_HEAD_M)
         & (slope <= MAX_SLOPE_GRADE)
     )
@@ -652,7 +1118,17 @@ def best_new_site(lake_lon: float, lake_lat: float, lake_elev: float, lake_volum
             if wall_fraction < MIN_WALL_FRACTION:
                 continue
 
-        head_m = float(head_grid[row, col])
+        # Real bug found this session (2026-09-03): head must be the difference between
+        # the two reservoirs' own WATER SURFACES (that's what actually drives the
+        # turbines), not between the new site's bare ground elevation (the dam's own
+        # foundation) and the existing lake's surface. head_grid (used above only for
+        # the cheap MIN_HEAD_M pre-filter/shortlist ranking, before water_level_m is
+        # known) uses ground elevation and was leaking into the FINAL reported head_m
+        # too — understating it by exactly dam_height_m for every "higher" candidate
+        # (checked: 17-31% of head_m on the current top candidates, not a rounding
+        # error). basin_volume() already returns the real, flooded water_level_m above;
+        # use that instead of re-reading the seed's own bare elevation.
+        head_m = head_from_water_levels(water_level_m, lake_elev)
         storage_mwh = storage_capacity_mwh(head_m, volume_m3)
         power_mw, implied_flow_m3_s, flow_limited = realistic_power_mw(storage_mwh, head_m, volume_m3)
         if best is None or power_mw > best["score"]:
@@ -664,6 +1140,25 @@ def best_new_site(lake_lon: float, lake_lat: float, lake_elev: float, lake_volum
                 row, col, elev, valid, pixel_dx_m, pixel_dy_m, surface_area_m2,
                 lon_grid, lat_grid, m_per_deg_lon, m_per_deg_lat,
             )
+            # When the practical-length search above found nothing, a second, wider
+            # diagnostic probe distinguishes "no valley shape here at all" from "there's
+            # a real valley, just wider than MAX_DAM_LENGTH_M" — the latter gets flagged
+            # unrealistic_dam_length_m rather than silently looking identical to the
+            # former in the output. Not used for dam_height_m/dam_length_m/
+            # concrete_volume_m3 below — those stay None either way, since neither case
+            # has a practical estimate to show.
+            unrealistic_dam_length_m = None
+            if dam_line is None:
+                diagnostic_line = dam_line_endpoints(
+                    row, col, elev, valid, pixel_dx_m, pixel_dy_m, surface_area_m2,
+                    lon_grid, lat_grid, m_per_deg_lon, m_per_deg_lat,
+                    half_length_override_m=UNREALISTIC_DAM_PROBE_HALF_M,
+                )
+                if diagnostic_line is not None:
+                    (dl_lon1, dl_lat1), (dl_lon2, dl_lat2) = diagnostic_line
+                    unrealistic_dam_length_m = math.hypot(
+                        (dl_lon2 - dl_lon1) * m_per_deg_lon, (dl_lat2 - dl_lat1) * m_per_deg_lat
+                    )
             # Dam height = how far the water rises above the dam site itself; dam length
             # = the illustrative dam_line's own length (see its docstring's caveats —
             # this inherits them, it's not a separate survey). No dam_line means no
@@ -687,9 +1182,12 @@ def best_new_site(lake_lon: float, lake_lat: float, lake_elev: float, lake_volum
                 "basin_volume_m3": basin_volume_m3,  # what the terrain could physically hold
                 "volume_m3": volume_m3,  # what's actually usable — capped by the existing lake
                 "lake_volume_m3": lake_volume_m3,
+                # volume_m3 < basin_volume_m3 directly (not re-deriving
+                # MAX_LAKE_DRAWDOWN_FRACTION * lake_volume_m3 here) so this can't drift
+                # out of sync with whatever usable_cycling_volume_m3() actually did.
                 "limited_by_existing_lake": (
                     lake_volume_m3 is not None and lake_volume_m3 > 0
-                    and lake_volume_m3 < basin_volume_m3
+                    and volume_m3 < basin_volume_m3
                 ),
                 "surface_area_m2": surface_area_m2,
                 "water_level_m": water_level_m,
@@ -700,6 +1198,10 @@ def best_new_site(lake_lon: float, lake_lat: float, lake_elev: float, lake_volum
                 # MIN_WALL_FRACTION gate" isn't the same as "comfortably contained" —
                 # this raw number is what lets a reader tell the difference).
                 "wall_fraction": wall_fraction,
+                # Only set when dam_line is None AND a wider diagnostic probe found a
+                # real axis anyway — "the valley here needs roughly this long a dam,
+                # over the MAX_DAM_LENGTH_M practical limit" (see the comment above).
+                "unrealistic_dam_length_m": unrealistic_dam_length_m,
                 "storage_mwh": storage_mwh,
                 "implied_flow_m3_s": implied_flow_m3_s,
                 "flow_limited": flow_limited,
@@ -734,7 +1236,8 @@ def load_lake_polygons(hydrolakes_shp_path) -> dict:
 def run_mode(mode: SearchMode, lakes: gpd.GeoDataFrame, empirical_model: tuple[float, float],
              lake_polygons: dict) -> list[dict]:
     print(f"Scanning {len(lakes)} lakes, mode={mode.name} "
-          f"(max dam height={mode.max_dam_height_m}m, max basin radius={mode.max_basin_radius_m}m)...")
+          f"(seed radius={mode.seed_radius_m:.0f}m, max dam height={mode.max_dam_height_m}m, "
+          f"max basin radius={mode.max_basin_radius_m}m)...")
     empirical_a, empirical_b = empirical_model
 
     records = []
@@ -768,6 +1271,61 @@ def run_mode(mode: SearchMode, lakes: gpd.GeoDataFrame, empirical_model: tuple[f
                 "lake_lon": lake.geometry.x,
                 "lake_lat": lake.geometry.y,
                 "lake_elevation_m": elevation,
+                "mode": mode.name,  # lets passes_display_filters() apply mode-specific
+                                     # thresholds (NATURAL's are looser — see MIN_DISPLAY_MW)
+                **result,
+            }
+        )
+
+    limited = sum(1 for r in records if r["limited_by_existing_lake"])
+    print(f"  {len(records)} lakes produced a candidate "
+          f"({skipped_no_elevation} skipped for missing elevation, "
+          f"{unknown_lake_volume} with unknown lake volume — not validated against it, "
+          f"{limited} capped by the existing lake's own volume)")
+    records.sort(key=lambda r: r["score"], reverse=True)
+    return records
+
+
+def run_plateau_mode(lakes: gpd.GeoDataFrame, empirical_model: tuple[float, float],
+                      lake_polygons: dict) -> list[dict]:
+    """PLATEAU's version of run_mode() — same loop, calls best_plateau_site() instead
+    of best_new_site() since PLATEAU isn't a SearchMode (see best_plateau_site()'s
+    docstring for why)."""
+    print(f"Scanning {len(lakes)} lakes, mode=plateau "
+          f"(max relief={PLATEAU_MAX_RELIEF_M}m, max radius={PLATEAU_MAX_RADIUS_M}m, "
+          f"embankment height={PLATEAU_EMBANKMENT_HEIGHT_M}m)...")
+    empirical_a, empirical_b = empirical_model
+
+    records = []
+    skipped_no_elevation = 0
+    unknown_lake_volume = 0
+    for _, lake in lakes.iterrows():
+        elevation = lake["elevation"]
+        if elevation is None or (isinstance(elevation, float) and math.isnan(elevation)):
+            skipped_no_elevation += 1
+            continue
+
+        lake_volume_m3 = lake["volume_m3"]
+        if lake_volume_m3 is None or (isinstance(lake_volume_m3, float) and math.isnan(lake_volume_m3)):
+            lake_volume_m3 = None
+            unknown_lake_volume += 1
+
+        lake_polygon = lake_polygons.get(lake["id"])
+        result = best_plateau_site(lake.geometry.x, lake.geometry.y, elevation, lake_volume_m3, lake_polygon)
+        if result is None:
+            continue
+
+        result["empirical_volume_m3"] = empirical_reservoir_volume_m3(
+            result["surface_area_m2"] / 1_000_000, empirical_a, empirical_b
+        )
+
+        records.append(
+            {
+                "lake_id": lake["id"],
+                "lake_lon": lake.geometry.x,
+                "lake_lat": lake.geometry.y,
+                "lake_elevation_m": elevation,
+                "mode": "plateau",  # see run_mode()'s matching field for why
                 **result,
             }
         )
@@ -789,8 +1347,18 @@ def to_geodataframe(rows: list[dict]) -> gpd.GeoDataFrame:
             "type": "lake-new",
             "rank": i + 1,
             "lake_id": r["lake_id"],
+            # The existing lake's own water surface altitude — sampled straight from the
+            # DEM at the lake's location, which (being already flooded) already shows
+            # today's water surface, not bare ground (see fetch_data.sample_elevation).
             "lake_elevation_m": round(r["lake_elevation_m"], 1),
+            # Bare ground at the seed/dam location — the future basin's LOWEST point,
+            # not its water surface once filled. See new_site_water_level_m for that.
             "new_site_elevation_m": round(r["site_elevation_m"], 1),
+            # The new reservoir's own water surface once filled — site_elevation_m plus
+            # however far it's flooded (or, for PLATEAU, diked) above that. This, not
+            # new_site_elevation_m, is the other side of the head_m subtraction below —
+            # see ReadmeAi.md's "How head is calculated" for the full picture.
+            "new_site_water_level_m": round(r["water_level_m"], 1),
             "head_m": round(r["head_m"], 1),
             "distance_m": round(r["distance_m"], 1),
             "direction": r["direction"],
@@ -810,6 +1378,14 @@ def to_geodataframe(rows: list[dict]) -> gpd.GeoDataFrame:
             "basin_bounded": r["basin_bounded"],
             "wall_fraction": (
                 round(r["wall_fraction"], 3) if r["wall_fraction"] is not None else None
+            ),
+            "unrealistic_dam_length_m": (
+                round(r["unrealistic_dam_length_m"]) if r["unrealistic_dam_length_m"] is not None else None
+            ),
+            # Only set by best_plateau_site() — r.get(), not r[], since NATURAL/
+            # ENGINEERED records (from best_new_site()) don't carry this key at all.
+            "flat_fraction": (
+                round(r["flat_fraction"], 3) if r.get("flat_fraction") is not None else None
             ),
             "dam_start_lon": round(dam_line[0][0], 6) if dam_line else None,
             "dam_start_lat": round(dam_line[0][1], 6) if dam_line else None,
@@ -833,15 +1409,18 @@ def to_geodataframe(rows: list[dict]) -> gpd.GeoDataFrame:
     )
 
 
-def contours_geodataframe(top_candidates: list[dict]) -> gpd.GeoDataFrame:
+def contours_geodataframe(top_candidates: list[dict], radius_m: float = SEARCH_RADIUS_M) -> gpd.GeoDataFrame:
     """Elevation contour lines for the search window around each of the given (already-
     ranked, top-N) candidates — reloads the DEM window per candidate (cheap: cached
     tiles, no network) rather than threading contour data through the whole search,
-    since only a handful of candidates ever need this, not every lake scanned."""
+    since only a handful of candidates ever need this, not every lake scanned.
+    radius_m defaults to SEARCH_RADIUS_M (NATURAL/ENGINEERED's own candidate radius) —
+    PLATEAU passes its own, larger PLATEAU_SEARCH_RADIUS_M so the drawn contours
+    actually reach a site that can legitimately sit farther from the lake than that."""
     properties = []
     geometries = []
     for rank, r in enumerate(top_candidates, start=1):
-        window = load_elevation_window(r["lake_lon"], r["lake_lat"], SEARCH_RADIUS_M)
+        window = load_elevation_window(r["lake_lon"], r["lake_lat"], radius_m)
         if window is None:
             continue
         elev, valid, _transform, lon_1d, lat_1d = window
@@ -873,7 +1452,11 @@ def basin_footprints_geodataframe(top_candidates: list[dict], mode: SearchMode) 
     properties = []
     geometries = []
     for rank, r in enumerate(top_candidates, start=1):
-        window = load_elevation_window(r["lake_lon"], r["lake_lat"], SEARCH_WINDOW_RADIUS_M)
+        # mode.seed_radius_m + 400, not the flat SEARCH_WINDOW_RADIUS_M — must match
+        # best_new_site()'s own window sizing (see its docstring) or a candidate found
+        # near NATURAL's wider seed_radius_m silently fails the row/col bounds check
+        # below and never gets its footprint drawn, even though it was found and ranked.
+        window = load_elevation_window(r["lake_lon"], r["lake_lat"], mode.seed_radius_m + 400)
         if window is None:
             continue
         elev, valid, transform, _lon_1d, _lat_1d = window
@@ -912,6 +1495,77 @@ def basin_footprints_geodataframe(top_candidates: list[dict], mode: SearchMode) 
     return gpd.GeoDataFrame(properties, geometry=geometries, crs="EPSG:4326")
 
 
+def plateau_footprints_geodataframe(top_candidates: list[dict]) -> gpd.GeoDataFrame:
+    """PLATEAU's version of basin_footprints_geodataframe() — reruns plateau_footprint()
+    (not basin_volume(), which doesn't apply here — see best_plateau_site()) once per
+    top-N candidate and vectorizes the result the same way."""
+    properties = []
+    geometries = []
+    for rank, r in enumerate(top_candidates, start=1):
+        # Must match best_plateau_site()'s own window radius (PLATEAU_SEARCH_WINDOW_
+        # RADIUS_M, not the smaller shared SEARCH_WINDOW_RADIUS_M) — otherwise a real
+        # candidate found out near the edge of PLATEAU_SEARCH_RADIUS_M loads a window
+        # too small to contain its own site_lon/site_lat, and the row/col bounds check
+        # below silently drops it (no footprint drawn on the map, even though a real
+        # candidate was found and ranked).
+        window = load_elevation_window(r["lake_lon"], r["lake_lat"], PLATEAU_SEARCH_WINDOW_RADIUS_M)
+        if window is None:
+            continue
+        elev, valid, transform, _lon_1d, _lat_1d = window
+        height, width = elev.shape
+
+        col = int(round((r["site_lon"] - transform.c) / transform.a - 0.5))
+        row = int(round((r["site_lat"] - transform.f) / transform.e - 0.5))
+        if not (0 <= row < height and 0 <= col < width):
+            continue
+
+        m_per_deg_lon, m_per_deg_lat = meters_per_degree(r["site_lat"])
+        pixel_dx_m = abs(transform.a) * m_per_deg_lon
+        pixel_dy_m = abs(transform.e) * m_per_deg_lat
+
+        fill_value = np.nanmax(elev[valid]) + 1.0
+        elev_filled = np.where(valid, elev, fill_value)
+        grad_y, grad_x = np.gradient(elev_filled, pixel_dy_m, pixel_dx_m)
+        slope = np.sqrt(grad_x**2 + grad_y**2)
+
+        _area_m2, visited = plateau_footprint(
+            elev, valid, slope, row, col, pixel_dx_m, pixel_dy_m,
+            PLATEAU_MAX_RELIEF_M, PLATEAU_MAX_RADIUS_M,
+        )
+        if not visited.any():
+            continue
+
+        polygons = [
+            shapely_shape(geom) for geom, value in rasterio_shapes(
+                visited.astype(np.uint8), mask=visited, transform=transform
+            )
+            if value == 1
+        ]
+        if not polygons:
+            continue
+
+        properties.append({"rank": rank, "lake_id": r["lake_id"]})
+        geometries.append(unary_union(polygons))
+
+    return gpd.GeoDataFrame(properties, geometry=geometries, crs="EPSG:4326")
+
+
+def passes_display_filters(r: dict) -> bool:
+    """Display-only gate applied to the ranked list before it's written to
+    docs/candidates_<mode>.geojson (the full, unfiltered ranking still goes to
+    data/candidates_<mode>_all.geojson) — both are the user's own calls (2026-09-03),
+    not a change to what best_new_site()/best_plateau_site() consider a valid
+    candidate. Thresholds are per-mode — see MIN_DISPLAY_MW and
+    MIN_VOLUME_RATIO_TO_LAKE for the reasoning (NATURAL is looser on both: cheap to
+    build, so a smaller/lower-power bowl is still worth showing)."""
+    mode = r["mode"]
+    if r["score"] < MIN_DISPLAY_MW[mode]:
+        return False
+    if r["lake_volume_m3"] is None or r["lake_volume_m3"] <= 0:
+        return False
+    return r["basin_volume_m3"] >= MIN_VOLUME_RATIO_TO_LAKE[mode] * r["lake_volume_m3"]
+
+
 def main() -> None:
     lakes = gpd.read_file(LAKES_OUT_PATH)
     docs_dir = Path(__file__).resolve().parent.parent / "docs"
@@ -934,12 +1588,12 @@ def main() -> None:
         to_geodataframe(records).to_file(all_path, driver="GeoJSON")
         print(f"  wrote {all_path} ({len(records)} candidates)")
 
-        top = records[:TOP_N]
+        top = [r for r in records if passes_display_filters(r)][:TOP_N[mode.name]]
         top_path = docs_dir / f"candidates_{mode.name}.geojson"
         to_geodataframe(top).to_file(top_path, driver="GeoJSON")
         print(f"  wrote {top_path} (top {len(top)})")
 
-        contours = contours_geodataframe(top)
+        contours = contours_geodataframe(top, radius_m=mode.seed_radius_m)
         contours_path = docs_dir / f"contours_{mode.name}.geojson"
         contours.to_file(contours_path, driver="GeoJSON")
         print(f"  wrote {contours_path} ({len(contours)} contour segments, "
@@ -957,17 +1611,25 @@ def main() -> None:
             )
             lake_vol_note = (
                 f"lake holds {r['lake_volume_m3']/1e6:.1f}Mm3, "
-                f"{'CAPPED to it' if r['limited_by_existing_lake'] else 'not the limit'}"
+                f"{'CAPPED to 50% of it' if r['limited_by_existing_lake'] else 'not the limit'}"
                 if r["lake_volume_m3"] else "lake volume unknown, not validated"
             )
             flow_note = (
                 f"flow CAPPED to {MAX_FLOW_RATE_M3_S}m3/s (would need {r['implied_flow_m3_s']:.0f}m3/s otherwise)"
                 if r["flow_limited"] else f"flow {r['implied_flow_m3_s']:.0f}m3/s, within realistic range"
             )
-            concrete_note = (
-                f"~{r['concrete_volume_m3']/1e6:.2f}Mm3 concrete (gravity-dam estimate, {r['dam_height_m']:.0f}m x {r['dam_length_m']:.0f}m)"
-                if r["concrete_volume_m3"] is not None else "no dam axis found — no concrete estimate"
-            )
+            if r["concrete_volume_m3"] is not None:
+                concrete_note = (
+                    f"~{r['concrete_volume_m3']/1e6:.2f}Mm3 concrete (gravity-dam estimate, "
+                    f"{r['dam_height_m']:.0f}m x {r['dam_length_m']:.0f}m)"
+                )
+            elif r["unrealistic_dam_length_m"] is not None:
+                concrete_note = (
+                    f"UNREALISTIC: needs a ~{r['unrealistic_dam_length_m']:.0f}m dam, over the "
+                    f"{MAX_DAM_LENGTH_M:.0f}m practical limit — no concrete estimate"
+                )
+            else:
+                concrete_note = "no dam axis found (no valley shape here) — no concrete estimate"
             wall_note = (
                 f", {r['wall_fraction']*100:.0f}% of basin boundary is real wall (>={MIN_WALL_FRACTION*100:.0f}% required)"
                 if r["wall_fraction"] is not None else ""
@@ -982,6 +1644,58 @@ def main() -> None:
                 f"({r['storage_mwh']:.0f}MWh @ {DESIGN_DISCHARGE_HOURS}h)"
             )
         print()
+
+    # PLATEAU isn't a SearchMode (see best_plateau_site()'s docstring for why), so it's
+    # not in the (NATURAL, ENGINEERED) loop above — same write/print pattern, plateau-
+    # specific fields (flat_fraction instead of wall_fraction, no dam/concrete notion).
+    plateau_records = run_plateau_mode(lakes, (empirical_a, empirical_b), lake_polygons)
+
+    all_path = DATA_DIR / "candidates_plateau_all.geojson"
+    to_geodataframe(plateau_records).to_file(all_path, driver="GeoJSON")
+    print(f"  wrote {all_path} ({len(plateau_records)} candidates)")
+
+    plateau_top = [r for r in plateau_records if passes_display_filters(r)][:TOP_N["plateau"]]
+    top_path = docs_dir / "candidates_plateau.geojson"
+    to_geodataframe(plateau_top).to_file(top_path, driver="GeoJSON")
+    print(f"  wrote {top_path} (top {len(plateau_top)})")
+
+    plateau_contours = contours_geodataframe(plateau_top, radius_m=PLATEAU_SEARCH_RADIUS_M)
+    contours_path = docs_dir / "contours_plateau.geojson"
+    plateau_contours.to_file(contours_path, driver="GeoJSON")
+    print(f"  wrote {contours_path} ({len(plateau_contours)} contour segments, "
+          f"{CONTOUR_INTERVAL_M}m interval)")
+
+    plateau_basins = plateau_footprints_geodataframe(plateau_top)
+    basins_path = docs_dir / "basins_plateau.geojson"
+    plateau_basins.to_file(basins_path, driver="GeoJSON")
+    print(f"  wrote {basins_path} ({len(plateau_basins)} basin footprint(s))")
+
+    for i, r in enumerate(plateau_top, start=1):
+        confidence = (
+            f"full footprint at this mode's {PLATEAU_MAX_RADIUS_M:.0f}m max radius/{PLATEAU_MAX_RELIEF_M:.0f}m max relief"
+            if r["basin_bounded"] else "may extend further — search-limited"
+        )
+        lake_vol_note = (
+            f"lake holds {r['lake_volume_m3']/1e6:.1f}Mm3, "
+            f"{'CAPPED to 50% of it' if r['limited_by_existing_lake'] else 'not the limit'}"
+            if r["lake_volume_m3"] else "lake volume unknown, not validated"
+        )
+        flow_note = (
+            f"flow CAPPED to {MAX_FLOW_RATE_M3_S}m3/s (would need {r['implied_flow_m3_s']:.0f}m3/s otherwise)"
+            if r["flow_limited"] else f"flow {r['implied_flow_m3_s']:.0f}m3/s, within realistic range"
+        )
+        print(
+            f"  #{i}: lake {r['lake_id']} -> new site {r['direction']}, "
+            f"head={r['head_m']:.0f}m, distance={r['distance_m']:.0f}m, "
+            f"footprint {r['surface_area_m2']/1e4:.1f}ha "
+            f"(cross-check predicts {r['empirical_volume_m3']/1e6:.2f}Mm3 for this footprint), "
+            f"usable={r['volume_m3']/1e6:.2f}Mm3 at a design {PLATEAU_EMBANKMENT_HEIGHT_M:.0f}m embankment "
+            f"({confidence}; {lake_vol_note}), {r['flat_fraction']*100:.0f}% of footprint is genuinely flat "
+            f"(>={PLATEAU_MIN_FLAT_FRACTION*100:.0f}% required), "
+            f"~{r['score']:.0f}MW, {flow_note} "
+            f"({r['storage_mwh']:.0f}MWh @ {DESIGN_DISCHARGE_HOURS}h)"
+        )
+    print()
 
 
 if __name__ == "__main__":

@@ -31,6 +31,19 @@ WATER_DENSITY_KG_M3 = 1000
 GRAVITY_M_S2 = 9.81
 ROUND_TRIP_EFFICIENCY = 0.85  # typical for pumped hydro; approximate
 
+MAX_LAKE_DRAWDOWN_FRACTION = 0.5  # user's call (2026-09-03): "don't use lake limit,
+                           # that would be impractical" — usable_cycling_volume_m3()
+                           # used to cap at 100% of the existing lake's own volume,
+                           # implying you could pump the whole lake dry every single
+                           # cycle. A real reservoir keeps a minimum operating level for
+                           # its other uses (irrigation, water supply, ecology, existing
+                           # hydropower, navigation) and only cycles a fraction of its
+                           # total volume as "active storage" — capping at half instead
+                           # is still a simplification (the real fraction depends on
+                           # each reservoir's own design and other commitments, which
+                           # this project has no data on per-lake), but a materially more
+                           # realistic one than assuming the whole lake is fair game.
+
 # Power (MW) isn't derivable from head/volume alone — that also needs a flow rate, which
 # depends on penstock/turbine sizing we don't model. Standard back-of-envelope approach:
 # assume the reservoir discharges over a fixed duration, so MW = MWh / hours.
@@ -245,6 +258,11 @@ def usable_cycling_volume_m3(new_site_volume_m3: float, existing_lake_volume_m3:
     the *new* site; it has no idea how big the anchor lake itself is, so a new site can
     come back with a much bigger footprint than the existing lake could ever fill.
 
+    The existing lake's own side of that limit is MAX_LAKE_DRAWDOWN_FRACTION of its
+    total volume, not all of it (see that constant's own comment for why: pumping an
+    existing reservoir completely dry every cycle isn't a realistic operating plan for
+    a lake that has other uses).
+
     existing_lake_volume_m3 is HydroLAKES' own estimate (see fetch_data.py) — a value we
     didn't compute, not derived from our DEM. None/<=0 means "unknown" (some small lakes
     aren't in HydroLAKES' volume model): in that case we can't validate the constraint,
@@ -253,4 +271,4 @@ def usable_cycling_volume_m3(new_site_volume_m3: float, existing_lake_volume_m3:
     """
     if existing_lake_volume_m3 is None or existing_lake_volume_m3 <= 0:
         return new_site_volume_m3
-    return min(new_site_volume_m3, existing_lake_volume_m3)
+    return min(new_site_volume_m3, MAX_LAKE_DRAWDOWN_FRACTION * existing_lake_volume_m3)

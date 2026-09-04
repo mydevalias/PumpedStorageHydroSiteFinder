@@ -20,6 +20,8 @@
   .legend h4 { margin: 0 0 6px; font-size: 13px; }
   .legend .swatch { display: inline-block; width: 20px; height: 3px; margin-right: 6px; vertical-align: middle; }
   .legend .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .legend summary { font-size: 12px; }
+  .legend details p { margin: 4px 0; }
   .popup-table td { padding: 1px 6px 1px 0; }
   .popup-table td:first-child { color: #555; }
   .mw-label {
@@ -55,10 +57,19 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 const MODES = [
   { key: 'natural', file: 'candidates_natural.geojson', contourFile: 'contours_natural.geojson',
     basinFile: 'basins_natural.geojson',
-    color: '#2563eb', dash: null, label: 'Natural / plateau depression (as-is)' },
+    color: '#2563eb', dash: null, label: 'Natural bowl (as-is depression)' },
   { key: 'engineered', file: 'candidates_engineered.geojson', contourFile: 'contours_engineered.geojson',
     basinFile: 'basins_engineered.geojson',
     color: '#ea580c', dash: '8 6', label: 'Engineered (dam built across a valley)' },
+  // Added 2026-09-02: a third category, distinct from both — a reservoir built by
+  // diking the perimeter of genuinely flat high ground, the way the real Lăpuștești
+  // upper reservoir actually is (see the green reference project on this same map).
+  // No natural depression (NATURAL) and no single wall across a valley (ENGINEERED) —
+  // see find_sites.py's PLATEAU config block for the real numbers this is calibrated
+  // against.
+  { key: 'plateau', file: 'candidates_plateau.geojson', contourFile: 'contours_plateau.geojson',
+    basinFile: 'basins_plateau.geojson',
+    color: '#9333ea', dash: '2 4', label: 'Plateau (diked flat ground)' },
 ];
 const REFERENCE_COLOR = '#16a34a';
 const CONTOUR_COLOR = '#a3742f';
@@ -81,6 +92,10 @@ const DESIGN_DISCHARGE_HOURS = 13;
 // wall_fraction itself is shown, not just a pass/fail badge; "passed" means "not
 // obviously fake," not "confidently real."
 const MIN_WALL_FRACTION = 0.6;
+const PLATEAU_MIN_FLAT_FRACTION = 0.8;  // mirrors find_sites.PLATEAU_MIN_FLAT_FRACTION
+const MAX_DAM_LENGTH_M = 300;  // mirrors find_sites.MAX_DAM_LENGTH_M — grounded in the
+                                  // real Tarnița (237m) and Someșul Cald (130m) dam crest
+                                  // lengths; a dam wall longer than this isn't practical here
 
 function googleMapsLink(lat, lon) {
   return `<a href="https://www.google.com/maps?q=${lat},${lon}" target="_blank" rel="noopener">${lat.toFixed(5)}, ${lon.toFixed(5)} &#8599;</a>`;
@@ -104,62 +119,98 @@ function linkCoords(p, siteLat, siteLon) {
   return [siteLat, siteLon];
 }
 
-function popupHtml(p, modeLabel, siteLat, siteLon) {
-  // basin_bounded=True means the flood grew until it needed a taller dam than this
-  // mode allows — NOT that it found where the terrain naturally closes (checked
-  // directly this session: basin_bounded candidates sit within ~2m of the height
-  // cap essentially every time). It's a real, full figure at that height, just not
-  // proof the true rim is right there rather than higher up.
-  const confidenceNote = p.basin_bounded
-    ? `full basin at the max dam height this mode allows (real figure, not a search-limited guess — but the true topographic rim could be higher still)`
-    : 'search-limited — cut off by the search radius/compute budget before reaching either a rim or the max dam height; true basin may be bigger than shown';
+function popupHtml(p, modeKey, modeLabel, siteLat, siteLon) {
+  const isNatural = modeKey === 'natural';
+  const isEngineered = modeKey === 'engineered';
+  const isPlateau = modeKey === 'plateau';
+
   const lakeVolumeRow = p.lake_volume_million_m3 != null
     ? `${p.lake_volume_million_m3} million m&sup3; (HydroLAKES)`
     : 'unknown — not validated against it';
   const usableVolumeRow = p.limited_by_existing_lake
-    ? `${p.volume_million_m3} million m&sup3; — <strong>capped by the existing lake</strong> (basin could hold ${p.basin_volume_million_m3})`
+    ? `${p.volume_million_m3} million m&sup3; — <strong>capped at 50% of the existing lake's volume</strong> (basin could hold ${p.basin_volume_million_m3}; the existing lake keeps the rest as its own operating reserve, not drained every cycle)`
     : `${p.volume_million_m3} million m&sup3; (existing lake isn't the limit)`;
   const flowRow = p.flow_limited
-    ? `<strong>capped at ${MAX_FLOW_RATE_M3_S} m&sup3;/s</strong> — full ${DESIGN_DISCHARGE_HOURS}h discharge would need ${p.implied_flow_m3_s} m&sup3;/s, no real single project moves that much water`
-    : `${p.implied_flow_m3_s} m&sup3;/s over ${DESIGN_DISCHARGE_HOURS}h — within a realistic single-project range`;
-  const concreteRow = p.concrete_volume_m3 != null
-    ? `~${(p.concrete_volume_m3 / 1e6).toFixed(2)} million m&sup3; (gravity-dam estimate: ${p.dam_height_m}m tall &times; ${p.dam_length_m}m long — crude; dam not drawn on the map, see legend)`
-    : 'no real dam axis found here (terrain doesn\'t clearly rise on both sides) — no estimate';
-  // wall_fraction is null for NATURAL (bowl_required already guarantees containment a
-  // different way). For ENGINEERED, this candidate passed >= MIN_WALL_FRACTION, but
-  // "passed" isn't the same as "comfortably contained" — see the const's own comment.
-  const wallRow = p.wall_fraction != null
-    ? `${Math.round(p.wall_fraction * 100)}% of the basin's own boundary is real terrain wall (>=${Math.round(MIN_WALL_FRACTION * 100)}% required to pass) — the rest is either this mode's own search-radius edge, or the open end a real dam's downstream side is expected to have`
-    : 'not applicable — natural/plateau depressions are required to be a real local minimum before search, a different containment guarantee';
+    ? `<strong>capped at ${MAX_FLOW_RATE_M3_S} m&sup3;/s</strong> — full ${DESIGN_DISCHARGE_HOURS}h discharge would need ${p.implied_flow_m3_s} m&sup3;/s`
+    : `${p.implied_flow_m3_s} m&sup3;/s over ${DESIGN_DISCHARGE_HOURS}h — realistic for one project`;
+
+  // basin_bounded=True means the flood/footprint grew until it hit this mode's own
+  // height/relief or radius budget — NOT that it found where the terrain naturally
+  // closes (checked directly: basin_bounded candidates sit within ~2m of that budget
+  // essentially every time). A real, full figure at that budget, not proof nothing
+  // bigger exists just past it.
+  const confidenceNote = p.basin_bounded
+    ? "full basin at this mode's own height/radius budget (real figure — but the true extent could be bigger)"
+    : 'search-limited — cut off before reaching either a rim or that budget; true basin may be bigger than shown';
+
+  // Third row, mode-specific: ENGINEERED's containment check (basin_wall_fraction),
+  // PLATEAU's flatness check (plateau_flat_fraction), or NATURAL's different, already-
+  // built-in guarantee (is_bowl — a real local minimum by construction).
+  let checkLabel, checkRow;
+  if (isEngineered) {
+    checkLabel = 'Containment check';
+    checkRow = p.wall_fraction != null
+      ? `${Math.round(p.wall_fraction * 100)}% of the basin's own boundary is real terrain wall (>=${Math.round(MIN_WALL_FRACTION * 100)}% required) — the rest is the search-radius edge, or the open downstream end a real dam is expected to have`
+      : 'n/a';
+  } else if (isPlateau) {
+    checkLabel = 'Flatness check';
+    checkRow = p.flat_fraction != null
+      ? `${Math.round(p.flat_fraction * 100)}% of the footprint is genuinely flat ground (>=${Math.round(PLATEAU_MIN_FLAT_FRACTION * 100)}% required)`
+      : 'n/a';
+  } else {
+    checkLabel = 'Containment guarantee';
+    checkRow = 'required to be a real local minimum before search — a different guarantee than the other two modes check for afterward';
+  }
+
+  // Dam/embankment row: ENGINEERED gets a real gravity-dam concrete estimate when an
+  // axis was found, or a flag when the valley is real but too wide (see
+  // unrealistic_dam_length_m); PLATEAU reports its own design embankment height
+  // (grounded in the real Lăpuștești dike, see find_sites.py) with no concrete
+  // estimate (a 2.7km perimeter ring dike, the real precedent's own scale, isn't
+  // comparable to dam_construction.py's short-wall assumption); NATURAL usually has
+  // neither, since its seed's own slope is often too gentle for any axis to draw.
+  let buildLabel = 'Concrete estimate', buildRow;
+  if (p.concrete_volume_m3 != null) {
+    buildRow = `~${(p.concrete_volume_m3 / 1e6).toFixed(2)} million m&sup3; (gravity-dam estimate: ${p.dam_height_m}m tall &times; ${p.dam_length_m}m long — crude, dam axis not drawn on the map)`;
+  } else if (p.unrealistic_dam_length_m != null) {
+    buildRow = `<strong>unrealistic</strong> — needs a ~${Math.round(p.unrealistic_dam_length_m)}m dam, over the ${MAX_DAM_LENGTH_M}m practical limit`;
+  } else if (isPlateau) {
+    buildLabel = 'Embankment design';
+    buildRow = `${p.dam_height_m}m ring dike around the footprint (matches the real Lăpuștești design — see legend) — no cost estimate, that project's own scale isn't comparable to a short valley-dam wall`;
+  } else {
+    buildRow = 'no real dam axis found here (terrain doesn\'t clearly rise on both sides) — no estimate';
+  }
+
   const [linkLat, linkLon] = linkCoords(p, siteLat, siteLon);
-  // ENGINEERED's pin is the dam location, not the lake's middle — see linkCoords'
-  // comment. isEngineered reuses the same wall_fraction != null signal as wallRow
-  // below (null only for NATURAL) rather than threading the mode key through.
-  const isEngineered = p.wall_fraction != null;
+  // ENGINEERED's pin is the dam location (the basin's downstream edge, not its middle
+  // — see linkCoords' comment); PLATEAU and NATURAL both sit close to their own
+  // footprint's centroid.
   const linkLabel = isEngineered ? 'Dam site on Google Maps' : 'New lake on Google Maps';
   const linkNote = isEngineered
-    ? ' (the low/downstream edge of the basin, where the dam would go — not the middle of the new lake, see the shaded shape for that)'
+    ? ' (the dam location — not the middle of the new lake, see the shaded shape for that)'
     : '';
+
   return `
     <strong>#${p.rank} — ${modeLabel}</strong>
     <table class="popup-table">
       <tr><td><strong>Est. power</strong></td><td><strong>${Math.round(p.estimated_mw).toLocaleString()} MW</strong></td></tr>
       <tr><td>Lake ID</td><td>${p.lake_id}</td></tr>
-      <tr><td>Lake elevation</td><td>${p.lake_elevation_m} m</td></tr>
+      <tr><td>Existing lake water altitude</td><td>${p.lake_elevation_m} m</td></tr>
       <tr><td>Existing lake volume</td><td>${lakeVolumeRow}</td></tr>
-      <tr><td>New site elevation</td><td>${p.new_site_elevation_m} m</td></tr>
+      <tr><td>New site ground level</td><td>${p.new_site_elevation_m} m (the dam/embankment's own foundation, not the new reservoir's water surface)</td></tr>
+      <tr><td>New reservoir water level</td><td>${p.new_site_water_level_m} m (once filled — this is the other side of Head, below)</td></tr>
       <tr><td>${linkLabel}</td><td>${googleMapsLink(linkLat, linkLon)}${linkNote}</td></tr>
-      <tr><td>Concrete estimate</td><td>${concreteRow}</td></tr>
+      <tr><td>${buildLabel}</td><td>${buildRow}</td></tr>
       <tr><td>Direction</td><td>new site is ${p.direction}</td></tr>
-      <tr><td>Head</td><td>${p.head_m} m</td></tr>
+      <tr><td>Head</td><td>${p.head_m} m (|new reservoir water level &minus; existing lake water altitude|)</td></tr>
       <tr><td>Distance</td><td>${p.distance_m} m</td></tr>
       <tr><td>Usable volume</td><td>${usableVolumeRow}</td></tr>
-      <tr><td>Basin surface</td><td>${p.surface_area_km2} km&sup2; (shaded shape on the map is the real footprint)</td></tr>
-      <tr><td>Cross-check (statistical)</td><td>${p.empirical_volume_million_m3} million m&sup3; — independent estimate from real reservoirs' area&rarr;volume, not our terrain model (loose floor, not precise)</td></tr>
+      <tr><td>Basin surface</td><td>${p.surface_area_km2} km&sup2; (shaded shape is the real footprint)</td></tr>
+      <tr><td>Cross-check</td><td>${p.empirical_volume_million_m3} million m&sup3; — independent estimate from real reservoirs' area&rarr;volume (loose floor, not precise)</td></tr>
       <tr><td>Required flow</td><td>${flowRow}</td></tr>
       <tr><td>Est. storage</td><td>${Math.round(p.storage_mwh).toLocaleString()} MWh @ ${DESIGN_DISCHARGE_HOURS}h</td></tr>
       <tr><td>Volume confidence</td><td>${confidenceNote}</td></tr>
-      <tr><td>Containment check</td><td>${wallRow}</td></tr>
+      <tr><td>${checkLabel}</td><td>${checkRow}</td></tr>
     </table>
   `;
 }
@@ -213,7 +264,7 @@ Promise.all([modesPromise, referencePromise]).then(([results, referenceData]) =>
       const [lakeCoord, siteCoord] = f.geometry.coordinates;
       const [lakeLon, lakeLat] = lakeCoord;
       const [siteLon, siteLat] = siteCoord;
-      const html = popupHtml(p, mode.label, siteLat, siteLon);
+      const html = popupHtml(p, mode.key, mode.label, siteLat, siteLon);
 
       const midLat = (lakeLat + siteLat) / 2;
       const midLon = (lakeLon + siteLon) / 2;
@@ -358,17 +409,29 @@ Promise.all([modesPromise, referencePromise]).then(([results, referenceData]) =>
 
   L.control.layers(null, overlays, { collapsed: false, position: 'topright' }).addTo(map);
 
+  // Reworked 2026-09-02 (user: "a lot of text") — a short, scannable key by default,
+  // with the fuller reasoning tucked behind a native <details> toggle instead of always
+  // shown. Nothing was deleted, just made opt-in — the popup already carries the same
+  // depth of explanation per candidate anyway, so the legend doesn't need to repeat it.
   const legend = L.control({ position: 'bottomright' });
   legend.onAdd = () => {
     const div = L.DomUtil.create('div', 'legend');
     div.innerHTML = `
       <h4>Case B: lake &rarr; new site</h4>
-      <span class="swatch" style="background:${MODES[0].color}; opacity:0.55"></span> natural/plateau depression — a genuine local low point, checked over as wide an area as the flood itself can grow into; usually broad and gently-sloping (a plateau), not a steep-walled mountain bowl. Filled shape is the new lake's real footprint (from the flood-fill, not a stand-in)<br>
-      <span class="swatch" style="background:${MODES[1].color}; opacity:0.55"></span> engineered (build a dam) — same, filled shape is the real footprint<br>
-      <span class="swatch" style="background:${CONTOUR_COLOR}"></span> elevation contours (${CONTOUR_INTERVAL_M}m interval, bold every ${CONTOUR_INTERVAL_M * CONTOUR_INDEX_EVERY}m — click a line for its elevation)<br>
-      <span class="swatch" style="background:${REFERENCE_COLOR}"></span> real, published project (e.g. Tarnița–Lăpuștești) — a benchmark, not one of our candidates<br>
-      <span class="dot" style="background:#999"></span> filled dot = existing lake, hollow dot = new site (for engineered, this is the dam location — the basin's downstream edge, not the middle of the new lake; for natural/plateau it's the bowl's own bottom, close to the middle)<br>
-      <span style="color:#555">thicker line = better rank (1st/2nd/3rd). Mid-line label: rank, estimated power (MW — capped so the required water flow never exceeds ${MAX_FLOW_RATE_M3_S} m&sup3;/s, a real single-project ceiling — see popup), the new site's own estimated volume (basin/bowl), head, distance from the existing lake — plus a second line if the volume is capped down by the existing lake. Small label under each lake: that lake's own volume (HydroLAKES) — the hard cap on how much water the new site can ever cycle, regardless of how big its basin could physically be. Dam location isn't drawn on the map for now (see popup for a crude concrete-volume estimate where one was found) — the shaded lake footprint is the more trustworthy visual.</span>
+      <span class="swatch" style="background:${MODES[0].color}; opacity:0.55"></span> Natural bowl<br>
+      <span class="swatch" style="background:${MODES[1].color}; opacity:0.55"></span> Engineered dam<br>
+      <span class="swatch" style="background:${MODES[2].color}; opacity:0.55"></span> Plateau (diked)<br>
+      <span class="swatch" style="background:${CONTOUR_COLOR}"></span> Contours (${CONTOUR_INTERVAL_M}m)<br>
+      <span class="swatch" style="background:${REFERENCE_COLOR}"></span> Real project (benchmark)<br>
+      <span class="dot" style="background:#999"></span> filled = existing lake &middot; hollow = new site<br>
+      <span style="color:#555">Thicker line = better rank. Shaded shape = real footprint. Click anything for details.</span>
+      <details style="margin-top:6px; color:#555;">
+        <summary style="cursor:pointer;">More on what each mode means</summary>
+        <p><strong>Natural bowl</strong>: a genuine local low point, checked over as wide an area as its own flood can grow into — a real, pre-existing depression.</p>
+        <p><strong>Engineered dam</strong>: any qualifying valley point where a wall would create the reservoir — the hollow dot is the dam location (the basin's downstream edge, not the lake's middle), gated by how much of the flooded footprint's own boundary is real terrain wall (see popup).</p>
+        <p><strong>Plateau</strong>: flat high ground diked around its perimeter, the way the real Lăpuștești upper reservoir actually is (green benchmark on this map) — no natural depression or valley wall involved, gated by how much of the footprint is genuinely flat (see popup).</p>
+        <p>Mid-line label: rank, estimated MW (flow capped at ${MAX_FLOW_RATE_M3_S} m&sup3;/s, a real single-project ceiling), the site's own volume estimate, head, distance — plus a second line if the existing lake caps the usable volume below that. Small label under each lake: its own volume (HydroLAKES) — at most half of that can be cycled per day (see popup), not the whole lake.</p>
+      </details>
     `;
     return div;
   };

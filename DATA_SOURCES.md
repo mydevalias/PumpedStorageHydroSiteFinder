@@ -1090,3 +1090,460 @@ adevarul.ro coverage of the Tarnița dam (checked 2026-09-01).
     ENGINEERED 97 -> 96 (this buffer applies to both modes' seed selection). 46/46
     tests pass, structural audit (head/distance recomputation, basin-contains-site,
     usable<=basin) re-run clean.
+- **2026-09-02** — User: "the link to google seems wrong. is it an aproximation?"
+  Checked concretely rather than guessing: the coordinates themselves aren't a stray
+  approximation beyond ~20-30m DEM pixel-center snapping (Copernicus GLO-30's own
+  resolution) — the real issue is what the pin points to. Measured, on the current top
+  candidates, the distance from each site's own coordinates to its basin footprint's
+  centroid: NATURAL sits 0-153m from center (small next to a ~1.2km basin — the seed
+  IS the bowl's bottom, so this tracks). ENGINEERED sits 362-795m from center — up to
+  a third of a 1.5-4km basin's own diagonal — because the seed there is the DAM
+  location, and a dam sits at the low/downstream EDGE of its reservoir by design, not
+  the middle. Both are correct, on-terrain answers — they're just answering different
+  questions ("where's the water" vs "where would you actually build") — but the popup
+  called both "New lake on Google Maps" regardless of mode, which is a real, misleading
+  claim for ENGINEERED specifically (clicking it does not take you to the middle of the
+  new lake there). Fixed in index.html: the link label, the hollow-dot marker's own
+  label, and the legend text are now mode-aware ("Dam site" for ENGINEERED, noting it's
+  the downstream edge not the lake's middle; unchanged wording for NATURAL). Pure map/
+  copy change — no Python, no data regeneration, no pipeline re-run needed.
+- **2026-09-02** — User asked for real engineering grounding before adding new
+  categories (unrealistic-dam flag, plateau mode) rather than picking parameters by
+  feel. Found and read the actual official feasibility study for the real project this
+  whole tool is calibrated against: **"Studiu de Fundamentare — Centrala cu Acumulare
+  prin Pompaj Tarnița-Lăpuștești"** (CNSP — Comisia Națională de Strategie și Prognoză,
+  2021), published at
+  https://cnp.ro/wp-content/uploads/2021/08/Studiu_fundamentare_Centrala_Tarnita_Lapustesti.pdf
+  (173 pages; fetched, extracted with `pypdf` since it's a scanned/compressed PDF
+  WebFetch's own text extraction couldn't read). Real, specific numbers for the
+  Lăpuștești upper reservoir (pg. 68-69 of the study) — the exact real precedent for
+  what this project calls "plateau" mode:
+  - Embankment (dig) height: **up to 40m** in cross-section ("digul are înălţimi până
+    la 40 m") — a full ring dike around the plateau's perimeter, not a single valley
+    wall, since there's no natural containment on a plateau by definition.
+  - Upstream slope 1:1.8, downstream slope 1:2.8, with 6m berms.
+  - Crest (coronament) axis length: **2715.00 m** — confirms this is a PERIMETER
+    structure (matches a plateau reservoir's own footprint boundary), categorically
+    different from a valley-crossing dam's short "wall span" — worth remembering if
+    this project ever tries to estimate plateau construction cost the same way
+    dam_construction.py does for valley dams; that formula assumes a short wall, not a
+    2.7km ring, and would badly misestimate a plateau if reused as-is.
+  - Crest width 7.00m; reservoir floor area 234,000 m²; lake surface area at max level
+    (1086.50 mdM) 388,750 m² (~0.39 km²); useful volume 10 million m³ (already the
+    figure in reference_projects.py, now independently re-confirmed from the primary
+    source rather than secondary Wikipedia coverage); sealing via a 16cm, 3-layer
+    bituminous-concrete membrane on the upstream face and reservoir floor.
+  Also found, same search, two more real Cluj-cascade dams useful as independent
+  calibration points for "practical dam length" (via
+  ro.wikipedia.org/wiki/Hidrocentrala_Tarni%C8%9Ba%E2%80%93L%C4%83pu%C8%99te%C8%99ti and
+  the feasibility study, pg. 33): Tarnița's own existing lower dam — 97m tall, 237m
+  crest length, concrete arch, completed 1974 (matches reference_projects.py); Someșul
+  Cald — 33.5m tall, ~130m crest, concrete gravity dam, ~7.5M m³ reservoir. Both real
+  dams sit above the user's MAX_DAM_LENGTH_M=200 practical cutoff (237m) or comfortably
+  under it (130m) — consistent with 200m as a reasonable dividing line for "a project at
+  this modest scale" specifically, not a claim that no real dam is ever longer.
+- **2026-09-02/03** — Large batch of user requests handled together: (1) more unit
+  tests grounded in this session's actual findings, (2) an "unrealistic engineered"
+  flag for candidates whose real valley is wider than MAX_DAM_LENGTH_M, (3) a new
+  PLATEAU category (see the CNSP citation entry above), (4) TOP_N raised 20 -> 100,
+  (5) legend reworked to be scannable rather than a wall of text.
+  - **Unrealistic-dam diagnostic**: added `UNREALISTIC_DAM_PROBE_HALF_M=1000` and a
+    `half_length_override_m` parameter on `dam_line_endpoints()` — when the practical
+    (200m-capped) search finds no axis, a second, much wider diagnostic probe checks
+    whether a real crossing exists further out, distinguishing "no valley shape at
+    all" from "there's a valley, just wider than practical" (`unrealistic_dam_length_m`
+    in the output). Checked the result against the real, freshly-rerun ENGINEERED
+    top-96 and found something more important than the feature itself: **0/96 have
+    either a normal axis or an unrealistic flag** — even a 2000m half-length (4000m
+    total) probe finds nothing. Traced why on the #1 candidate (lake 1360316,
+    wall_fraction=0.616, a genuinely well-contained real basin): real walls exist close
+    by (20-140m) across a ~180deg arc, but the OPPOSITE side never rises 5m within
+    1000m in any sampled direction — that's the valley's real, open downstream side.
+    `dam_line_endpoints()` requires a straight line through the seed where BOTH ends
+    (180deg apart) rise — which is structurally impossible for any real one-sided
+    valley, i.e. what a dam site actually is by definition. This isn't new breakage —
+    it's the same known weakness noted in `dam_line_endpoints()`'s own docstring
+    ("not every candidate is a clean two-walled valley"), just now conclusively
+    demonstrated as the norm rather than the exception once ENGINEERED's candidates
+    are properly validated (basin_wall_fraction) instead of being small artificial
+    sprawls dam_line_endpoints happened to get lucky on. Documented rather than
+    redesigned this session — a real fix needs finding each side's own wall
+    independently (not a single symmetric line), which is a real algorithm change, not
+    a quick patch, and this project already has other information (basin_wall_fraction)
+    correctly answering "is this real" even when the illustrative axis can't be drawn.
+  - **PLATEAU mode**: implemented as a genuinely separate search (`best_plateau_site()`,
+    not a SearchMode — its seed test is "flat over a window" not "locally lowest" or
+    "any qualifying point", and its volume model is `footprint_area *
+    PLATEAU_EMBANKMENT_HEIGHT_M`, a fixed design depth, NOT basin_volume()'s natural
+    flood-fill integral, since a diked plateau pond has no natural water level to speak
+    of). Every constant grounded in the real Lăpuștești numbers found this session (see
+    citation entry above) rather than guessed: `PLATEAU_EMBANKMENT_HEIGHT_M=40.0`
+    (exact match to "digul are înălţimi până la 40 m"). First calibration pass
+    (`PLATEAU_MAX_SLOPE_GRADE=0.3`, `PLATEAU_MAX_RADIUS_M=700`) was checked against real
+    output before committing: 29% of an 80-lake sample found a candidate (vs. NATURAL's
+    <1%, ENGINEERED's ~9-11%) with footprints of 65-155ha — 2-4x the real reference's
+    own 38.9ha. Tightened to `PLATEAU_MAX_SLOPE_GRADE=0.15` (~8.5deg) and
+    `PLATEAU_MAX_RADIUS_M=450` (modest headroom over Lăpuștești's own ~350m equivalent
+    radius, not 2x) — re-checked: 12.5% of the same sample, footprints 40-63ha, a much
+    closer match to the one real precedent this mode has. Full pipeline run: 143 lakes
+    produced a plateau candidate (more than ENGINEERED's 96 — flat ground turns out to
+    be less rare than a real valley crossing in this DEM, at least at these
+    thresholds), 134 of them capped by the existing lake's own volume (raw plateau
+    footprint volume routinely exceeds what the paired lake could actually cycle).
+    `plateau_wall_fraction` doesn't apply here (there's no natural wall on a diked
+    plateau by definition) — `plateau_flat_fraction()` is the analogous check instead,
+    verifying the footprint's OWN interior stayed genuinely flat, not just its seed.
+  - **Real bug caught before shipping**: `flat_fraction` was computed and printed to
+    the CLI correctly but never added to `to_geodataframe()`'s properties dict — the
+    written geojson (and therefore the map popup, which reads `p.flat_fraction`) would
+    have silently shown nothing for every PLATEAU candidate. Caught by trying to
+    actually read the field back out of the written file before moving on, not by
+    trusting the CLI output looked right. Fixed (`r.get("flat_fraction")`, since only
+    `best_plateau_site()` sets this key — `best_new_site()` records don't have it at
+    all, unlike `wall_fraction`/`unrealistic_dam_length_m` which both modes' functions
+    always include, set to None when not applicable).
+  - **Map**: `MODES` gained a third entry (`plateau`, purple `#9333ea`, dashed).
+    `popupHtml()` reworked to take `modeKey` explicitly instead of inferring
+    ENGINEERED-vs-NATURAL from `wall_fraction != null` (that proxy broke the moment
+    PLATEAU also had `wall_fraction: null`) — now branches cleanly across all three
+    modes for the containment/flatness row, the dam/embankment row (including the new
+    unrealistic-dam flag and PLATEAU's embankment-design note), and the Google Maps
+    link label. Legend condensed to a short scannable list with a native `<details>`
+    toggle for the fuller reasoning — nothing deleted, just made opt-in, per the user's
+    "a lot of text" complaint. `TOP_N` raised to 100 (draws/computes 5x more per mode,
+    the pipeline takes proportionally longer — contours/basin footprints both rerun
+    real per-candidate work, not just a display slice).
+  - Structural audit re-run on the final output (head/distance recomputation,
+    basin-contains-site, usable<=basin, plus PLATEAU-specific checks: flat_fraction
+    present and >=0.8, embankment height exactly 40.0m) — 0 issues across all 201
+    candidates (5 natural + 96 engineered + 100 plateau). 10 new tests added (56 total,
+    1 real-DEM skip when no dam axis exists to check a length on) — including direct
+    regressions for the height-cap wall-counting bug, the half_length_override_m
+    diagnostic probe, plateau_footprint()'s growth/cap behavior, and the three
+    user-flagged real-world cases from this session (#10 promontory, #3's real-shore
+    distance, no dam ever exceeding MAX_DAM_LENGTH_M). 56/56 pass.
+- **2026-09-03** — User: "it still doesn't find the lesu projects" (after PLATEAU mode
+  shipped). Investigated properly rather than re-asserting the earlier NATURAL-mode
+  conclusion still applied to a different mode:
+  - Checked PLATEAU near Leșu (real dam coordinates, from the earlier OSM lookup) and
+    found the true cause: `PLATEAU_WINDOW_PX`'s seed pre-check used `maximum_filter`
+    (EVERY pixel in a 9x9 window must pass the slope test) — 698 individual pixels
+    near Leșu passed the per-pixel slope test, but the all-must-pass window check
+    failed EVERY one of them (0 candidates). A single noisy or narrowly-steep DEM cell
+    anywhere in the window is enough to fail it, even on ground that's broadly flat.
+  - Tried to cross-check PLATEAU against its own real calibration site (Tarnița/
+    Lăpuștești) first and found the same 0-candidate result there too — but on
+    inspection this was inconclusive, not confirmatory: the coordinate used
+    (23.2806, 46.7025) was never an independently-verified real location for the
+    actual Lăpuștești plateau, only `reference_projects.py`'s own approximate stand-in
+    ("highest point found in our own DEM search" — flagged as approximate when it was
+    written). Raw elevation there (995-1108m, peaking at the center and falling off in
+    every direction) is a rounded hilltop, not a flat plateau, and PEAKS 22m above the
+    feasibility study's own documented 1086m maximum — strong evidence this specific
+    point isn't the real site. Recorded honestly rather than treated as a second
+    confirmation it wasn't.
+  - Fixed the real bug anyway (Leșu's evidence stood on its own): replaced
+    `maximum_filter` with `uniform_filter` (mean slope in the window, not "every pixel
+    must pass") for the seed pre-check. `plateau_footprint()`'s own per-cell growth
+    check is untouched — still requires every individual added cell to pass the strict
+    slope bar, so a genuinely rough patch inside an otherwise-flat area still correctly
+    stops growth there; this only changes which SEED gets a chance to grow from.
+  - Tested whether the growth function needed the same relaxation (smoothing the whole
+    slope grid before use, not just the seed check): checked footprint size at Leșu
+    with smoothing window sizes 1/3/5 — 6.9ha / 6.1ha / 7.5ha, no meaningful
+    improvement. Concluded this is real terrain, not just noise: the Apuseni Mountains
+    around Leșu genuinely don't have a Lăpuștești-scale (38.9ha) contiguous flat area
+    nearby, only smaller pockets — left the growth function's per-cell check as-is
+    rather than loosen it further on weak evidence.
+  - Re-ran the full pipeline: PLATEAU coverage 143 -> 227 lakes. Lake 1352457 (Leșu)
+    now appears — rank 39, 134.4MW, footprint 4.97ha, flat_fraction=1.00. Small
+    relative to the real reference, but real: this is genuinely what the terrain there
+    supports, not the "good place" scale the user may have expected, and said so
+    plainly rather than oversell a small result. 56/56 tests pass. Structural audit
+    (head/distance recomputation, basin-contains-site, usable<=basin, flat_fraction
+    gate) re-run clean across all 201 candidates.
+- **2026-09-03** — User: "let's not display any project under 50 mv [MW]." Added
+  `MIN_DISPLAY_MW = 50`, applied after ranking (so it doesn't change which candidate
+  wins for a given lake — score is still the ranking key — only whether a
+  below-threshold candidate makes it into `docs/candidates_<mode>.geojson`/the map).
+  The full, unfiltered ranking still goes to `data/candidates_<mode>_all.geojson`
+  (never published) for anyone who wants the complete picture later. Applied uniformly
+  to NATURAL/ENGINEERED (the shared loop) and PLATEAU (its own block) rather than only
+  one, since the request was about "any project", not one mode specifically.
+- **2026-09-03** — User asked for an ELI5 head explanation in the README, framed as
+  "deepest point of the new lake vs the water level of the existing lake". Checking
+  that framing against the actual code (rather than just documenting whatever was
+  there) surfaced a real, significant bug: `head_m` was computed from the new site's
+  BARE GROUND elevation at the seed/dam location, not its water surface once actually
+  flooded/diked. Since water_level_m = site_elev + dam_height_m (or +
+  PLATEAU_EMBANKMENT_HEIGHT_M), this understated head by exactly however tall the new
+  structure was — checked on real current candidates: 17-31% of head_m, not a rounding
+  error, and MW scales directly with head so this fed straight into every power
+  estimate. Root cause: `head_grid` (a cheap per-pixel proxy computed before the flood/
+  dike result is known, used only for the initial MIN_HEAD_M pre-filter and shortlist
+  ranking) was being reused for the FINAL reported head_m too, instead of being
+  recomputed once the real water_level_m was available. Fixed in both
+  `best_new_site()` and `best_plateau_site()`: `head_m` now comes from
+  `head_from_water_levels(water_level_m, lake_elev)`, a small pure function pulled out
+  specifically because a one-line mistake here had an outsized, easy-to-miss effect —
+  see ReadmeAi.md's "How head is calculated" for the full, corrected explanation and
+  three direct unit tests (including one checked against the real, published Tarnița-
+  Lăpuștești head of 563.5m). `new_site_water_level_m` is now also a first-class output
+  field (was computed internally but never written to the geojson) so the popup can
+  show both sides of the subtraction, not just assert a number.
+  - Also added, same session: `MIN_DISPLAY_MW = 50` ("let's not display any project
+    under 50 mv") and `MIN_VOLUME_RATIO_TO_LAKE = 2.0` ("remove project that are not
+    ... at least twice (water volume)" of the existing dam) — both display-only gates
+    (`passes_display_filters()`), applied after ranking so they don't change what
+    best_new_site()/best_plateau_site() themselves consider valid, only what's written
+    to docs/candidates_<mode>.geojson. The volume-ratio filter deliberately compares
+    the new site's own uncapped basin_volume_m3 against the lake, not the already-
+    capped usable volume_m3 — comparing a lake-capped candidate's usable volume (by
+    definition equal to the lake's own volume) against that same lake can never clear
+    a 2x bar, which would silently exclude every lake-limited candidate regardless of
+    how large its real basin actually is.
+  - Combined effect of the head fix + both filters, checked on a full re-run: NATURAL
+    dropped to 0 displayed candidates (its 5 raw candidates: 2 have basin volumes well
+    under the paired lake's own — 0.39x and 0.58x — and the other 3 are under 50MW;
+    none clear both bars at once), ENGINEERED to 1, PLATEAU to 49. A stark reduction,
+    reported plainly rather than softened — this is what the terrain and the user's
+    own stated bar actually support, not a bug in the filtering.
+  - Also refactored while touching this code (user: "simplify the code, if you find
+    methods worth extracting as pure methods and test"): pulled the lake-shoreline-
+    exclusion logic (previously identical inline code in both best_new_site() and
+    best_plateau_site()) into a shared `compute_within_lake_mask()`. Added direct unit
+    tests for both new functions plus `passes_display_filters()` (9 new tests, 65
+    total, 1 skip). Structural audit re-run clean on the final output, including a
+    fresh recomputation of head_m from the new water-level-based formula (not just the
+    old ground-elevation check, which would have missed exactly the bug just fixed).
+
+- **2026-09-03 — Usable volume capped at 50% (not 100%) of the existing lake;
+  MAX_DAM_LENGTH_M 200→300; TOP_N 100→20.** Three changes from the same round of
+  feedback, applied together and re-verified together.
+  - `usable_cycling_volume_m3()` (scripts/volumes.py) previously let a new site draw
+    down the paired lake's *entire* volume every cycle if the lake was the limiting
+    factor. User: "don't use lake limit, that would be impractical. The new lake
+    should be at most 50%." A real reservoir keeps an operating/dead-storage reserve
+    and isn't fully drained on every cycle, so the cap is now
+    `MAX_LAKE_DRAWDOWN_FRACTION * existing_lake_volume_m3`, with
+    `MAX_LAKE_DRAWDOWN_FRACTION = 0.5`. Confirmed the exact fraction with the user via
+    AskUserQuestion before changing it (rather than guessing 50% was literal vs.
+    illustrative). This lowers `estimated_mw`/`storage_mwh` for every lake-limited
+    candidate (roughly halves them), which in turn interacts with the
+    `MIN_DISPLAY_MW = 50` filter — some candidates that used to clear 50MW under the
+    100% cap no longer do. This is a direct, intended consequence of the change, not a
+    regression: half the water half the flow, roughly half the power.
+  - Also fixed a bug this exposed: `limited_by_existing_lake` (find_sites.py, both
+    NATURAL/ENGINEERED and PLATEAU code paths) still compared
+    `lake_volume_m3 < basin_volume_m3` — correct when the cap *was* the full lake
+    volume, but wrong now that the cap is half of it. Changed both occurrences to
+    compare the actual capped `volume_m3 < basin_volume_m3`, so the flag (and the CLI's
+    "CAPPED to 50% of it" note) reflects what's really limiting the site.
+  - `MAX_DAM_LENGTH_M`: 200 → 300. User: "i think we should also increase the dam size
+    to 300m or to a volume of concreate. i'm not sure what is practical here." Checked
+    both options against real numbers found earlier this session: Tarnița's actual dam
+    crest is 237m (arch), Someșul Cald's is 130m (gravity) — 300m gives real headroom
+    above both without being arbitrary. Considered a concrete-volume cap instead, but
+    rejected it: the only real figure available (16,000m³ surface + 192,000m³
+    underground concrete from the Tarnița-Lăpuștești CNSP feasibility study) covers the
+    *whole* CHEAP scheme — tunnels and underground powerhouse included — not a dam wall
+    in isolation, so there's no clean apples-to-apples number to cap against. Updated
+    both the Python constant and its mirrored JS constant in docs/index.html (the JS
+    copy was missed in the same commit initially — caught before shipping by grepping
+    for `MAX_DAM_LENGTH_M` across the repo, not just editing the file just touched).
+  - `TOP_N`: 100 → 20. User: "also do top 20 for each type; engeniered, platou, natural
+    etc." Reverts the temporary 100 used earlier this session to eyeball PLATEAU output
+    during its calibration; 20 per mode is the intended steady-state display size.
+  - Re-ran the full pipeline and structural audit after all three changes (head/water-
+    level formula, basin-contains-site, usable-volume ≤ basin-volume, usable-volume ≤
+    50% of lake-volume when lake-limited, MIN_DISPLAY_MW, MIN_VOLUME_RATIO_TO_LAKE, and
+    — new this round — MAX_DAM_LENGTH_M itself against every displayed ENGINEERED
+    candidate's `dam_length_m`). Clean. Full test suite: 66 passed, 1 skipped (two
+    `test_volumes.py` cases updated for the new 50% cap: expected usable volumes
+    halved from their old 100%-cap values; one new direct test added asserting the cap
+    is exactly `MAX_LAKE_DRAWDOWN_FRACTION * lake_volume`, not the whole lake).
+  - Displayed-candidate counts, this run vs. the 2026-09-02 entry above (100%-cap,
+    200m, top-100 run): NATURAL 0 → 0 (unchanged — its raw candidates were already
+    failing on MW or volume-ratio before the cap change, not on the cap itself).
+    ENGINEERED 1 → 1 (the one survivor, lake 1360316, has such a large head/basin that
+    it clears 50MW even fully capped: usable dropped from 15.8Mm³ under the old 100%
+    cap to 7.9Mm³ now, MW dropped accordingly but stayed at ~1028MW — nowhere near the
+    50MW floor). PLATEAU 49 → 17 (the mode most exposed to the cap: PLATEAU's design is
+    a fixed 40m embankment depth over a footprint, so its raw MW scales close to
+    linearly with usable volume, and most PLATEAU sites are paired with lakes not much
+    bigger than the new footprint — halving the cap pushed roughly two-thirds of the
+    previous PLATEAU survivors below the 50MW line).
+
+- **2026-09-03 — MIN_DISPLAY_MW and MIN_VOLUME_RATIO_TO_LAKE split per-mode; NATURAL
+  loosened on both.** Same day as the two entries above, immediately after seeing
+  NATURAL drop to 0 displayed candidates. User: "ok, for natural allow a smaller mw
+  given it is cheaper to build", then "at leat[sic], 2x-lake volume rati[o], if the new
+  lake is smallert that is still good" — read together as: keep both filters as real
+  bars, but NATURAL's version of each should be looser, because a natural bowl needs no
+  dam or embankment at all (bowl_required already guarantees containment) — the wall/
+  dike cost that justifies ENGINEERED/PLATEAU's stricter bars doesn't exist for NATURAL.
+  - Both constants changed from a single number to a `{mode_name: threshold}` dict:
+    `MIN_DISPLAY_MW = {"natural": 10, "engineered": 50, "plateau": 50}` and
+    `MIN_VOLUME_RATIO_TO_LAKE = {"natural": 0.0, "engineered": 2.0, "plateau": 2.0}`.
+    10MW for NATURAL is grounded in the widely-used regulatory "small hydro" cutoff (EU,
+    China, among others) rather than picked arbitrarily — below it, treat as noise;
+    above it, a cheap natural bowl is worth showing even far under ENGINEERED/PLATEAU's
+    floor. NATURAL's volume-ratio floor is 0 (no requirement at all) — a natural bowl
+    smaller than the lake it's paired with is still worth building since it costs almost
+    nothing to add, unlike a new dam/dike that has to earn its construction cost.
+  - `passes_display_filters(r)` now looks up `r["mode"]` to pick the right threshold —
+    required adding a `"mode"` field to every record in `run_mode()` (mode.name) and
+    `run_plateau_mode()` (hardcoded "plateau", since PLATEAU isn't a SearchMode — see
+    `best_plateau_site()`'s docstring for why).
+  - Re-ran the full pipeline. NATURAL: 0 → 5 displayed (all 5 of its raw candidates now
+    clear the mode's own bars — two of them, lake 1357337 at 303MW/0.39x ratio and lake
+    170943 at 165MW/0.58x ratio, were already well above 10MW and were only ever being
+    excluded by the >=2x ratio bar, which no longer applies to NATURAL). ENGINEERED and
+    PLATEAU unchanged (1 and 17) — their thresholds didn't move.
+  - Structural audit re-run with mode-aware thresholds (each mode checked against its
+    own MIN_DISPLAY_MW/MIN_VOLUME_RATIO_TO_LAKE entry, not a single shared number) —
+    clean. Full test suite: 70 passed, 1 skipped (4 new tests: NATURAL's MW floor is
+    below ENGINEERED's, a record passes under NATURAL's floor but fails under
+    ENGINEERED's with identical numbers, NATURAL passes with a new lake smaller than
+    the existing one, ENGINEERED still fails the same case).
+
+- **2026-09-03 — PLATEAU_SEARCH_RADIUS_M added (2000m → 3000m for PLATEAU only); PLATEAU's
+  MIN_VOLUME_RATIO_TO_LAKE dropped 2.0 → 0.0.** User: "why it doesn't naturaly find
+  tarnita lapus... let's tune the algoritm until it also finds the tarnita lapus
+  naturaly, for plateu searches." Investigated with real DEM data rather than guessing:
+  - Loaded the real DEM window around lake 169355 (real Tarnița) and checked every cell
+    against PLATEAU's own flatness test directly: within the old SEARCH_RADIUS_M=2000,
+    nothing above 886.5m passes it at all — terrain climbs too steeply close to the
+    lake. Widened the loaded window to 8000m and searched further out: found a genuine,
+    flat_fraction=1.0, ~16ha contiguous flat area at 1007-1034m elevation, 2718-2800m
+    **due west** of the lake centroid — same latitude as the lake, matching both the
+    real Lăpuștești village's own direction (found via WebSearch, 46.71-46.72°N,
+    7-7.5km further west — the plateau itself needn't be as far as the village center,
+    just the same general direction) and the CNSP feasibility study's "left mountainside
+    adjacent to the reservoir" description. Computed head from that spot: 541.8m,
+    within 4% of the real published 563.5m.
+  - Added `PLATEAU_SEARCH_RADIUS_M = 3000` (own constant, not shared with NATURAL/
+    ENGINEERED's `SEARCH_RADIUS_M=2000` — a diked plateau reservoir can legitimately sit
+    farther from the lake than a valley-adjacent dam site) and
+    `PLATEAU_SEARCH_WINDOW_RADIUS_M = PLATEAU_SEARCH_RADIUS_M + 400`, wired into
+    `best_plateau_site()`'s window load and distance filter. 3000m gives the real
+    2718-2800m cluster comfortable margin without reaching a second, unrelated, much
+    taller summit cluster that starts appearing past ~4900m in a different compass
+    direction (checked — deliberately left outside).
+  - Found and fixed a real bug this exposed: `plateau_footprints_geodataframe()` (draws
+    the actual footprint polygon for each displayed candidate) reloaded its DEM window
+    with the OLD, smaller `SEARCH_WINDOW_RADIUS_M` — any candidate now found past 2400m
+    would silently fail the row/col bounds check and never get drawn on the map, even
+    though it was found and ranked correctly. Fixed to use
+    `PLATEAU_SEARCH_WINDOW_RADIUS_M`. Also gave `contours_geodataframe()` an optional
+    `radius_m` parameter (default `SEARCH_RADIUS_M`, PLATEAU's call passes
+    `PLATEAU_SEARCH_RADIUS_M`) so the drawn contour lines actually reach a farther-out
+    PLATEAU site instead of stopping short at 2000m.
+  - Re-ran the full pipeline with just the radius change: PLATEAU raw coverage 224 → 343
+    lakes. Lake 169355 (real Tarnița)'s own best PLATEAU candidate: head=537.5m (real
+    563.5m, 4.6% low), basin_volume=11.59M m³ (real published upper-reservoir design
+    volume 10.0M m³, 16% high), ~1110MW (real published rating ~1000MW, 11% high),
+    flat_fraction=1.0, distance=2999m (right at the new radius edge). A strikingly close
+    match to the real project on every axis, found by the algorithm's own search, not
+    placed by hand — but its own ratio (11.59M basin / 74.0M lake = 0.157) is still
+    below the existing MIN_VOLUME_RATIO_TO_LAKE["plateau"]=2.0 floor, so it wouldn't
+    have displayed without the second change below. Lake 1352457 (Leșu) also improved
+    (found a bigger footprint within the new radius: 289.3MW vs the old 148.5MW, ratio
+    0.600 vs 0.229) but was still short of 2.0.
+  - Since the ratio floor would exclude PLATEAU's own real-world precedent — the exact
+    project this whole mode is grounded in — at its own found ratio of 0.157, this
+    wasn't a judgment call: dropped `MIN_VOLUME_RATIO_TO_LAKE["plateau"]` to 0.0,
+    matching NATURAL. Real diking cost (unlike NATURAL's free natural containment) is
+    still real, but MIN_DISPLAY_MW's 50MW floor already screens for a project too small
+    to be worth it; no non-zero ratio value between 0 and 0.157 has any real grounding
+    behind it, so didn't invent one.
+  - Re-ran the full pipeline with both changes. PLATEAU displayed: 17 → 20 (TOP_N cap).
+    Real Tarnița (lake 169355) now appears at **rank 2** (1109.9MW) — found naturally by
+    the search, matching the real project as described above. Leșu (lake 1352457,
+    289.3MW) did NOT make the top 20 this time: removing the ratio floor let many more
+    large-lake-paired candidates qualify nationally (the new top 20 ranges 370-1131MW),
+    and Leșu's real, modest 289MW no longer clears that bar competing against them. This
+    is a ranking outcome, not a bug — reported plainly rather than silently re-tuning
+    TOP_N to force it back in, since "top 20 nationally per mode" was the user's own
+    explicit call.
+  - Full test suite: 73 passed, 1 skipped (3 new tests: PLATEAU's ratio floor is 0,
+    a direct regression on the real 0.157 Tarnița ratio still passing, and a real-DEM
+    regression running `best_plateau_site()` against real Tarnița and checking the
+    result lands within 10%/25% of the real published head/volume, is genuinely flat,
+    and sits beyond the old 2000m radius — proving PLATEAU_SEARCH_RADIUS_M is what
+    made it findable, not something already reachable before). Structural audit
+    (head formula, usable≤basin, 50% lake cap, per-mode MW/ratio thresholds, 300m dam
+    cap, PLATEAU flat_fraction≥0.8) re-run clean across all 26 displayed candidates
+    (5 natural + 1 engineered + 20 plateau). Verified all 20 displayed PLATEAU
+    footprints actually draw on the map (confirms the footprint-window bug above is
+    really fixed, not just the search itself).
+
+- **2026-09-03 — TOP_N split per-mode; PLATEAU raised 20 → 50.** Immediately after the
+  above: user checked and noticed Leșu (lake 1352457) — a real candidate they'd
+  specifically flagged and had verified earlier this session — wasn't on the map
+  ("but we said we will do the top based on type, so lesu should appear"). Checked the
+  raw numbers: Leșu is rank 42 of 343 raw PLATEAU candidates nationally (289.3MW);
+  rank 20's cutoff sits at 370.3MW. "Top 20 per type" was working exactly as specified
+  (each mode ranked and cut independently) — it just wasn't what got Leșu back on the
+  map, because PLATEAU_SEARCH_RADIUS_M and the ratio-floor drop (both same day, above)
+  let ~40 more large-lake-paired candidates qualify above it nationally, none of that
+  specific to Leșu.
+  - Asked the user directly (AskUserQuestion) rather than guessing whether to raise
+    TOP_N for all three modes or just PLATEAU: chose PLATEAU-only, to 50. NATURAL (5 raw
+    candidates total) and ENGINEERED (96 raw) don't have enough candidates for the
+    cutoff to matter the same way — PLATEAU (343 raw) is the one mode where a 20-cap
+    was actually excluding real, verified finds.
+  - `TOP_N` changed from a single int to a `{mode_name: int}` dict:
+    `{"natural": 20, "engineered": 20, "plateau": 50}`, read via `TOP_N[mode.name]` in
+    the NATURAL/ENGINEERED loop and `TOP_N["plateau"]` in the PLATEAU block.
+  - Re-ran the full pipeline. PLATEAU displayed: 20 → 50. Real Tarnița (lake 169355)
+    stays at rank 2 (1109.9MW, unchanged). Leșu (lake 1352457) now appears at **rank
+    42** (289.3MW), exactly where the raw ranking put it. Structural audit (all the
+    existing checks, plus a new one: each mode's displayed count against its own
+    TOP_N cap, and each candidates_<mode>.geojson file's own sort order) — clean.
+    Verified all 50 PLATEAU footprints draw, including rank 42 specifically. Full test
+    suite: 73 passed, 1 skipped (unchanged — TOP_N is a display-count constant, not
+    search/ranking logic, so no new test was needed beyond the existing display-filter
+    coverage).
+
+- **2026-09-03 — TOP_N["natural"] raised to 50 too (no-op currently); NATURAL given its
+  own seed_radius_m=2500 (2000 default), and a real bowl found near Leșu.** Two separate
+  user calls, same day:
+  - "for natural increase it to 50 too" — applied the same TOP_N split to NATURAL for
+    consistency. Currently a no-op on what's displayed (NATURAL only has 5-13 raw
+    candidates nationally, well under even the old 20 cap) but keeps the three modes'
+    caps expressed the same way, and NATURAL's own raw pool grew this same day (below).
+  - "i believe near lesu there is a very good natural spoot" — checked with real DEM
+    data rather than assumed. NATURAL's own bowl test (local minimum over a ~500m
+    window) finds 537 qualifying pixels around lake 1352457 (Leșu): 527 sit inside the
+    lake's own footprint (expected — a lake IS the local minimum of its own basin), and
+    of the 10 real, external ones, every single one sits BEYOND the shared
+    SEARCH_RADIUS_M=2000 (2307-3070m out). Ran basin_volume() on the strongest one
+    directly: 22.54605E/46.81261N, 841m elevation, 2307m from the lake — a real,
+    POUR-POINT-BOUNDED (not radius/height-capped) basin holding 12.27M m³, head 347.4m,
+    ~269MW. Confirmed the user's instinct with a real, contained basin, not a maybe.
+  - Added `seed_radius_m` to `SearchMode` (default `SEARCH_RADIUS_M`, i.e. no change for
+    ENGINEERED, which deliberately keeps the shared 2000m — widening it once already
+    surfaced the much bigger pre-existing containment problem documented above under
+    SEARCH_WINDOW_RADIUS_M, a margin tweak alone doesn't fix that). NATURAL overrides it
+    to 2500 — enough margin for the confirmed 2307m bowl without reaching the weaker
+    (31-119MW) points further out (2408-3070m) that the same investigation found but
+    didn't specifically motivate widening for.
+  - `best_new_site()` now loads its window and applies its distance filter using
+    `mode.seed_radius_m` instead of the flat `SEARCH_RADIUS_M`/`SEARCH_WINDOW_RADIUS_M`.
+    Fixed the same "footprint silently fails to draw past the old window" bug class as
+    PLATEAU's earlier fix, this time in `basin_footprints_geodataframe()` (used by both
+    NATURAL and ENGINEERED) and gave `contours_geodataframe()`'s call in the main
+    NATURAL/ENGINEERED loop `radius_m=mode.seed_radius_m` too, so contour lines reach a
+    farther-out NATURAL site instead of stopping short at 2000m.
+  - Added a direct real-DEM regression (`test_natural_search_now_finds_a_real_bowl_near_lesu`)
+    asserting `best_new_site()` on real Leșu returns a candidate beyond the old
+    SEARCH_RADIUS_M, with a real pour point (not radius/height-capped), a substantial
+    basin (>5M m³), and >100MW — locks in the finding, not just the radius number.
+  - Re-ran the full pipeline. NATURAL raw candidates: 5 → 13 (nationally, not just at
+    Leșu — the wider radius is a systematic fix, confirmed by more than one new find).
+    Displayed: 5 → 12. Leșu (lake 1352457) now appears at **rank 2, 268.6MW** — matching
+    the manual check above almost exactly. Structural audit (all existing checks, plus
+    each mode's displayed count against its own TOP_N, and file sort order) — clean
+    across all 63 displayed candidates (12 natural + 1 engineered + 50 plateau). Full
+    test suite: 74 passed, 1 skipped.

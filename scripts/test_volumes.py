@@ -55,6 +55,7 @@ from volumes import (
     DESIGN_DISCHARGE_HOURS,
     MAX_BASIN_CELLS,
     MAX_FLOW_RATE_M3_S,
+    MAX_LAKE_DRAWDOWN_FRACTION,
 )
 
 DEM_AVAILABLE = fetch_data.DEM_DIR.exists() and any(fetch_data.DEM_DIR.glob("*.tif"))
@@ -258,9 +259,23 @@ class TestUsableCyclingVolume(unittest.TestCase):
     small volume you will never have enough water to fill the second one.'"""
 
     def test_small_lake_caps_a_bigger_basin(self):
+        # Capped at MAX_LAKE_DRAWDOWN_FRACTION (0.5) of the lake, not the whole lake
+        # (user's call, 2026-09-03 — "don't use lake limit, that would be
+        # impractical" — see that constant's own comment for the reasoning).
         self.assertEqual(
             usable_cycling_volume_m3(new_site_volume_m3=100_000_000, existing_lake_volume_m3=5_000_000),
-            5_000_000,
+            2_500_000,
+        )
+
+    def test_cap_is_exactly_the_drawdown_fraction_of_the_lake_not_the_whole_lake(self):
+        # Direct regression for the fraction itself, independent of any specific
+        # numbers above — locks in that MAX_LAKE_DRAWDOWN_FRACTION is really being
+        # applied to existing_lake_volume_m3, not silently ignored or misapplied to
+        # new_site_volume_m3 instead.
+        lake_volume_m3 = 8_000_000
+        self.assertEqual(
+            usable_cycling_volume_m3(new_site_volume_m3=1e12, existing_lake_volume_m3=lake_volume_m3),
+            MAX_LAKE_DRAWDOWN_FRACTION * lake_volume_m3,
         )
 
     def test_big_lake_does_not_cap_a_smaller_basin(self):
@@ -449,13 +464,16 @@ class TestBasinVolumeRealWorld(unittest.TestCase):
 
     def test_tiny_anchor_lake_caps_a_much_bigger_basin(self):
         # Same search (lake 1360316, see above), but claiming it only holds 300K m3 (it
-        # really holds ~15.8M) — the usable volume must drop to that cap, while the
-        # basin's own physical size (basin_volume_m3) stays whatever the terrain
-        # actually supports. 300K stays comfortably below any plausible real basin here.
+        # really holds ~15.8M) — the usable volume must drop to MAX_LAKE_DRAWDOWN_
+        # FRACTION (0.5) of that claimed 300K, i.e. 150K, not the full 300K (see that
+        # constant's own comment — capping at the whole lake was the user's own call to
+        # remove, 2026-09-03) — while the basin's own physical size (basin_volume_m3)
+        # stays whatever the terrain actually supports. 150K stays comfortably below
+        # any plausible real basin here.
         lon, lat, elev_m = 22.459219129732748, 44.937792400784815, 231.0
         result = find_sites.best_new_site(lon, lat, elev_m, 300_000, find_sites.ENGINEERED)
         self.assertIsNotNone(result)
-        self.assertEqual(result["volume_m3"], 300_000)
+        self.assertEqual(result["volume_m3"], 150_000)
         self.assertGreater(result["basin_volume_m3"], 300_000)
         self.assertTrue(result["limited_by_existing_lake"])
 
