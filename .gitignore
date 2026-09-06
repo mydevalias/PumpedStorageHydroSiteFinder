@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .venv/
 .idea/
+
+# large re-downloadable raw data
+data/dem/
+data/lakes_raw/
