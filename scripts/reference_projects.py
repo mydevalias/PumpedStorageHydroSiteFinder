@@ -26,12 +26,19 @@ REFERENCE_PROJECTS = [
         "lake_lat": 46.721549912777185,
         "lake_elevation_m": 521.5,
         # The Lăpuștești plateau's exact intake coordinates aren't published anywhere we
-        # found. This is the highest point in our own DEM search window near Tarnița
-        # (1075.7m) — close to the real 1085m and geometrically plausible (within the
-        # search radius, in the right direction) but NOT an independently confirmed site
-        # location. Treat this marker's position as approximate; head/volume/MW are real.
-        "site_lon": 23.280417307625946,
-        "site_lat": 46.70382169183256,
+        # found. This used to be the highest point in our own DEM search window near
+        # Tarnița (1075.7m south of the lake) — found wrong (2026-09-18): our own later
+        # PLATEAU search (once PLATEAU_SEARCH_RADIUS_M widened enough to look far enough
+        # out) independently found a real, genuinely flat plateau ~3km DUE WEST of the
+        # lake instead, matching real published figures closely (head/volume/MW all
+        # within ~15%) and matching the real Lăpuștești village's own compass direction
+        # (found via WebSearch) — the south-facing hilltop this used to point to was a
+        # coincidental high point, not evidence of anything. Updated to that real search
+        # result. Still an approximation, not a surveyed location (see
+        # test_reference_projects.py, which keeps this within 800m of whatever our own
+        # search currently finds there, and DATA_SOURCES.md for the full investigation).
+        "site_lon": 23.23985002532147,
+        "site_lat": 46.72278693717133,
         "new_site_elevation_m": 1085.0,
         "head_m": 563.5,
         "volume_million_m3": 10.0,  # real design cycling volume, upper reservoir

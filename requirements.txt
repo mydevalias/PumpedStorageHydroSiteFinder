@@ -1,6 +1,7 @@
-requests
-geopandas
-shapely
-rasterio
-scipy
-contourpy
+requests==2.34.2
+geopandas==1.1.4
+shapely==2.1.2
+rasterio==1.5.1
+scipy==1.18.1
+contourpy==1.3.3
+numpy==2.5.2

@@ -481,6 +481,58 @@ class TestRealWorldRegressions(unittest.TestCase):
             self.skipTest("this real search found no dam axis to check a length on")
         self.assertLessEqual(result["dam_length_m"], MAX_DAM_LENGTH_M + 1.0)  # +1 rounding room
 
+    def test_engineered_known_large_basin_stays_real_and_well_contained(self):
+        # Direct regression (2026-09-18) for ENGINEERED.seed_radius_m 2000 -> 3000: lake
+        # 1360316 is the one basin over 50M m^3 found in the widened-radius scan that
+        # motivated the change (see ENGINEERED's own comment in find_sites.py for the
+        # full national scan this was checked against — 186 candidates, only this one
+        # over 50M m^3). Pins that it stays real and well-contained, not just large.
+        lon, lat, elev_m, lake_volume_m3 = 22.459219129732748, 44.937792400784815, 231.0, 15_800_000.0
+        result = find_sites.best_new_site(lon, lat, elev_m, lake_volume_m3, ENGINEERED)
+        self.assertIsNotNone(result)
+        self.assertGreaterEqual(result["wall_fraction"], MIN_WALL_FRACTION)
+        # Real Romanian ceiling, not an arbitrary round number: Vidraru, one of the
+        # country's largest actual dams, holds ~465M m^3 — see DATA_SOURCES.md.
+        self.assertLess(result["basin_volume_m3"], 500_000_000)
+
+    def test_engineered_wider_radius_does_not_reintroduce_the_mega_sprawl_regression(self):
+        # Broad, deliberately NOT lake-specific sanity net -- the whole point of "do not
+        # overfit" (user, 2026-09-18): a test pinned to one known lake only proves that
+        # ONE case stays fixed, not that the fix generalizes. Scans a spread sample of
+        # real lakes (every 15th, ~73 of 1100 -- cheap enough for the test suite, wide
+        # enough to catch a new sprawl case appearing somewhere else in the country) with
+        # the real, current ENGINEERED mode and asserts every candidate found, wherever
+        # it is, stays under the same real-world ceiling. This is the actual regression
+        # test for the 2026-09-02 mega-sprawl bug (175/522 candidates at 40-220M m^3,
+        # see SEARCH_WINDOW_RADIUS_M's docstring) -- it must keep passing even if a
+        # future change (a bigger seed_radius_m, a tighter MIN_WALL_FRACTION, a DEM
+        # update) shifts which specific lakes produce ENGINEERED's largest basins.
+        import geopandas as gpd
+
+        lakes = gpd.read_file(fetch_data.LAKES_OUT_PATH)
+        polygons = load_lake_polygons(fetch_data.fetch_hydrolakes_raw())
+        checked = 0
+        for _, lake in lakes.iloc[::15].iterrows():
+            elevation = lake["elevation"]
+            if elevation is None or (isinstance(elevation, float) and math.isnan(elevation)):
+                continue
+            lake_volume_m3 = lake["volume_m3"]
+            if isinstance(lake_volume_m3, float) and math.isnan(lake_volume_m3):
+                lake_volume_m3 = None
+            result = find_sites.best_new_site(
+                lake.geometry.x, lake.geometry.y, elevation, lake_volume_m3,
+                ENGINEERED, polygons.get(lake["id"]),
+            )
+            checked += 1
+            if result is None:
+                continue
+            self.assertLess(
+                result["basin_volume_m3"], 500_000_000,
+                f"lake {lake['id']}: basin_volume_m3={result['basin_volume_m3']:.0f} "
+                f"looks like the mega-sprawl regression, not a real basin",
+            )
+        self.assertGreater(checked, 50, "sample too small to be a meaningful sanity net")
+
     def test_plateau_search_now_finds_a_real_match_to_tarnita_lapustesti(self):
         # User (2026-09-03): "let's tune the algoritm until it also finds the tarnita
         # lapus naturaly, for plateu searches." Direct regression on the real search

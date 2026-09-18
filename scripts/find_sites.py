@@ -502,6 +502,32 @@ ENGINEERED = SearchMode(
     # dam_line_endpoints() itself is cheap (8 direction samples, no flood-fill), so this
     # mainly costs more basin_volume() calls, not a proportionally bigger runtime hit.
     max_volume_candidates=40,
+    # 2000 -> 3000 (user's call, 2026-09-18: "the algorithm should be smart enough to
+    # find that... do not overfit; there should be more" — after NATURAL/PLATEAU's
+    # own seed_radius_m widenings each turned up a real, missed site, ENGINEERED was
+    # the one mode still stuck at the shared default despite sitting at just 1 displayed
+    # candidate nationally, the clearest sign of the same under-coverage.
+    #
+    # NOT done blindly: widening ENGINEERED's reach specifically caused a real, serious
+    # regression earlier this session (see SEARCH_WINDOW_RADIUS_M's own docstring above —
+    # 175/522 candidates with 40-220M m^3 basins, a mega-sprawl the old dam_line_endpoints()
+    # gate couldn't catch) and was deliberately reverted rather than left broken. What's
+    # different now: basin_wall_fraction() replaced dam_line_endpoints() as the actual
+    # containment gate specifically BECAUSE of that failure, checking the basin's own
+    # real flooded boundary rather than a short fixed-length probe — so the fix that
+    # caused the regression back then no longer applies unmodified today. Re-tested the
+    # exact same failure mode directly before changing anything (not assumed fixed):
+    # scanned all 1100 lakes with only seed_radius_m widened (max_basin_radius_m/window
+    # padding untouched) at both 3000m and 4000m. At 3000m: candidates 96 -> 186 (not a
+    # one-lake bump — genuinely more real sites nationally), only ONE basin over 50M m^3
+    # (lake 1360316, 136.6M m^3, wall_fraction=0.607 — comfortably real, well below
+    # Romania's actual largest reservoir, Vidraru, at ~465M m^3), and seed distances
+    # spread broadly across the full range (p50=2167m, p90=2919m) rather than clustered
+    # right at the new edge (which would suggest an artifact of the cutoff itself, not a
+    # genuine result). Picked 3000m specifically (not the also-clean 4000m result) to
+    # match PLATEAU's own already-justified radius rather than introduce a fourth,
+    # freestanding distance constant with no separate grounding of its own.
+    seed_radius_m=3000,
 )
 
 

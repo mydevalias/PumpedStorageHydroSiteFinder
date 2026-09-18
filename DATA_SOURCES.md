@@ -1547,3 +1547,103 @@ adevarul.ro coverage of the Tarnița dam (checked 2026-09-01).
     each mode's displayed count against its own TOP_N, and file sort order) — clean
     across all 63 displayed candidates (12 natural + 1 engineered + 50 plateau). Full
     test suite: 74 passed, 1 skipped.
+
+- **2026-09-18 — Fixed the real reason "still not finding the proposed tarnita project":
+  the reference-project benchmark marker was pointing at the wrong hill, ~3.9km from
+  where our own search actually finds it.** User reported this two weeks after the
+  Sep-3 investigation that made PLATEAU find a real, well-matching Tarnița candidate
+  (rank 2, 1109.9MW, within ~15% of every published figure) — so the natural first
+  question was whether that still held (it did: unchanged, verified fresh) rather than
+  what was actually wrong.
+  - Checked what "the proposed tarnita project" actually refers to on the map: a
+    separate, distinct green "real project (benchmark)" layer drawn from
+    `reference_projects.py`/`docs/reference_projects.geojson` — NOT the same feature as
+    our own PLATEAU candidate for lake 169355, just meant to sit near it for comparison.
+    Its site coordinates were still the ORIGINAL, pre-PLATEAU-mode stand-in from
+    2026-09-01 ("highest point in our own DEM search window", already flagged as
+    approximate at the time) — nothing had ever updated it once the real PLATEAU search
+    (added 2026-09-02/03) found a genuinely better, real-terrain-matching location.
+    Measured the gap directly: 3.9km. On the map, the green benchmark line points south
+    to a hilltop; our own purple PLATEAU line points west to the real plateau. Two
+    unrelated-looking features — a numeric match in a CLI report never showed up as a
+    visual one, so "still not finding it" was a completely reasonable thing to see.
+  - Along the way, also found a real (if minor) reproducibility gap while re-verifying:
+    calling `best_plateau_site()` directly for lake 169355 gave a ~12% smaller footprint
+    (910MW vs the pipeline's own 1109.9MW) than the full `find_sites.py` run — traced to
+    `requirements.txt` having no pinned versions, so a `pip install` today (numpy 2.5.2,
+    scipy 1.18.1 — both newer than whatever was installed 2026-09-03) can very slightly
+    shift which cells clear `PLATEAU_MAX_SLOPE_GRADE`'s threshold near its own boundary.
+    The head/DEM-sampled elevation matched exactly (538m / 1012.5m, bit-identical) — only
+    the BFS growth extent wobbled. Pinned all six dependencies to their exact currently-
+    installed versions so this can't silently drift again between sessions/machines.
+    (The actual shipped pipeline output is unaffected by this — `find_sites.py`'s own
+    full run reproduced the original 1109.9MW/11.59M m³ exactly once re-run end to end.)
+  - Fix, following the user's "loop and do changes with test until it finds it": wrote
+    `scripts/test_reference_projects.py` FIRST (`TestReferenceProjectSitesMatchOurOwnSearch`),
+    asserting the Tarnița reference marker sits within 800m of whatever
+    `best_plateau_site()` currently finds for lake 169355 — confirmed it FAILED against
+    the old coordinates (3747m gap) before touching anything. Updated
+    `reference_projects.py`'s Tarnița `site_lon`/`site_lat` to our own search's real,
+    verified result (23.23985°E/46.72279°N) and reran the test until it passed (184m
+    gap — the small residual is the same BFS-growth wobble noted above, well within the
+    800m tolerance chosen specifically to survive that). `new_site_elevation_m`/`head_m`
+    stay the real PUBLISHED figures (1085m/563.5m) — only the marker's PLACEMENT changed,
+    not the cited real numbers.
+  - Regenerated `docs/reference_projects.geojson` and reran the full `find_sites.py`
+    pipeline end to end (fresh numbers under the now-pinned dependencies, not stale
+    Sep-4 output). Structural audit clean across all 63 displayed candidates. Full test
+    suite: 75 passed, 1 skipped (new: `test_tarnita_reference_site_is_near_our_own_best_plateau_candidate`,
+    a real-DEM regression that keeps failing loudly if this gap ever reopens — e.g. if a
+    future PLATEAU config change shifts the winning seed elsewhere without updating the
+    reference marker to match).
+
+- **2026-09-18 — ENGINEERED given its own seed_radius_m=3000 (was stuck at the shared
+  2000m default).** User: "the algorithm should be smart enough to find that [on its
+  own]... add one more strategy that algorithmically finds this type of place; do not
+  overfit; there should be more." Read as: don't just hand-fix one more example (the
+  reference marker, above) — generalize the principle NATURAL and PLATEAU already
+  proved out this same day (a real site can sit past the old shared radius) to whatever
+  mode is still obviously under-covered, and verify it broadly rather than tuning to
+  one lake.
+  - ENGINEERED was the clear candidate: stuck at 1 displayed candidate nationally, the
+    same shape of under-coverage NATURAL (was 0) and PLATEAU (was missing its own real
+    precedent) both had before their own radius fixes.
+  - NOT done blindly — widening ENGINEERED's reach specifically caused a real, serious
+    regression earlier this session (2026-09-02: 175/522 candidates with 40-220M m^3
+    basins, a mega-sprawl the old `dam_line_endpoints()` containment check couldn't
+    catch — see SEARCH_WINDOW_RADIUS_M's own docstring). Re-tested that exact failure
+    mode directly before touching the constant, rather than assuming `basin_wall_fraction()`
+    (added afterward, specifically because of that failure) had already fixed it:
+    scanned all 1100 lakes with only `seed_radius_m` widened (independently, at 3000m
+    and 4000m) using a throwaway `SearchMode` copy, not the real one. Both were clean —
+    at 3000m: 96 -> 186 candidates nationally (not a one-lake effect), only ONE basin
+    over 50M m^3 (lake 1360316, 136.6M m^3, wall_fraction=0.607 — real and comfortably
+    below Romania's actual largest reservoir, Vidraru, at ~465M m^3), and candidate
+    distances spread broadly (p50=2167m, p90=2919m), not clustered right at the new
+    edge the way an artifact of the cutoff itself would look. Picked 3000m over the
+    also-clean 4000m result specifically to reuse PLATEAU's own already-justified
+    radius rather than add a fourth, ungrounded distance constant.
+  - Added `seed_radius_m=3000` to `ENGINEERED`'s `SearchMode` definition — no other code
+    changes needed, since `best_new_site()`, `basin_footprints_geodataframe()`, and the
+    `contours_geodataframe()` call already read `mode.seed_radius_m` generically (built
+    that way for NATURAL's own widening, same day) — this is the whole benefit of that
+    earlier refactor: "one more strategy" turned out to mean reusing the SAME general
+    mechanism a third time, not building something new.
+  - Added two tests, deliberately not just one pinned to the known lake (user: "do not
+    overfit" — a test that only proves the one known case stays fixed doesn't prove the
+    fix generalizes): `test_engineered_known_large_basin_stays_real_and_well_contained`
+    (direct regression on lake 1360316's real numbers) AND
+    `test_engineered_wider_radius_does_not_reintroduce_the_mega_sprawl_regression` (scans
+    a spread sample of ~73 real lakes — every 15th of 1100 — asserting every candidate
+    found anywhere in that sample stays under the same real-world 500M m^3 ceiling; this
+    is the actual regression test for the 2026-09-02 bug, general enough to catch it
+    resurfacing somewhere else in the country, not just at the one lake already known).
+  - Re-ran the full pipeline. ENGINEERED raw: 96 -> 186. Displayed: 1 -> 2 (lake
+    1360316 stays rank 1 at ~1083MW; lake 1361871 newly clears both display floors at
+    ~51MW, wall_fraction 0.909). Structural audit (all existing checks, plus the same
+    500M m^3 sanity ceiling and a wall_fraction>=0.6 check applied directly to the
+    output) — clean across all 64 displayed candidates. Full test suite: 77 passed, 1
+    skipped.
+  - NATURAL and PLATEAU's own radii (2500m/3000m) were left as they are — this round
+    was specifically about closing ENGINEERED's gap to match, not re-opening an
+    already-settled number without new evidence for it.
