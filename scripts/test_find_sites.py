@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 from scipy.ndimage import minimum_filter
+from shapely.geometry import Point
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -23,6 +24,8 @@ from find_sites import (
     head_from_water_levels,
     load_lake_polygons,
     meters_per_degree,
+    pair_basins_with_lakes,
+    pair_existing_lakes,
     passes_display_filters,
     plateau_flat_fraction,
     plateau_footprint,
@@ -39,7 +42,11 @@ from find_sites import (
     PLATEAU_MAX_SLOPE_GRADE,
     PLATEAU_MIN_FLAT_FRACTION,
     UNREALISTIC_DAM_PROBE_HALF_M,
+    WATERSHED_MAX_PAIRING_DISTANCE_M,
+    MIN_HEAD_M,
+    TWINLAKE_MIN_SLOPE,
 )
+from volumes import MAX_LAKE_DRAWDOWN_FRACTION
 from volumes import basin_volume
 
 PIXEL_M = 30.0
@@ -551,6 +558,26 @@ class TestRealWorldRegressions(unittest.TestCase):
         self.assertAlmostEqual(result["basin_volume_m3"], 10_000_000, delta=2_500_000)
         self.assertEqual(result["flat_fraction"], 1.0)
 
+    def test_min_head_is_enforced_on_the_real_flooded_head_not_the_ground_proxy(self):
+        # Real bug (2026-09-19): lake 170958's NATURAL candidate sat LOWER than the lake
+        # with 108m of bare-ground drop (passing the pre-filter) but only 47.8m of real
+        # head once flooded 60m deep — and was displayed at 99.6MW. Whatever the search
+        # returns for this lake now must clear MIN_HEAD_M on the water-to-water head.
+        lakes = __import__("geopandas").read_file(fetch_data.LAKES_OUT_PATH)
+        lake = lakes[lakes["id"] == 170958].iloc[0]
+        polygon = load_lake_polygons(fetch_data.fetch_hydrolakes_raw()).get(170958)
+        for mode in (NATURAL, ENGINEERED):
+            result = find_sites.best_new_site(
+                lake.geometry.x, lake.geometry.y, float(lake["elevation"]), float(lake["volume_m3"]), mode, polygon,
+            )
+            if result is not None:
+                self.assertGreaterEqual(result["head_m"], MIN_HEAD_M)
+        result = find_sites.best_plateau_site(
+            lake.geometry.x, lake.geometry.y, float(lake["elevation"]), float(lake["volume_m3"]), polygon,
+        )
+        if result is not None:
+            self.assertGreaterEqual(result["head_m"], MIN_HEAD_M)
+
     def test_natural_search_now_finds_a_real_bowl_near_lesu(self):
         # User (2026-09-03): "i believe near lesu there is a very good natural spoot."
         # Direct regression on the real search over real Leșu (lake 1352457): a genuine,
@@ -698,6 +725,180 @@ class TestPassesDisplayFilters(unittest.TestCase):
         r = self._record(score=MIN_DISPLAY_MW["engineered"] + 1, lake_volume_m3=1_000_000,
                           basin_volume_m3=100_000, mode="engineered")
         self.assertFalse(passes_display_filters(r))
+
+
+@unittest.skipUnless(
+    LAKES_AVAILABLE and HYDROLAKES_AVAILABLE,
+    "requires data/lakes.geojson and the cached HydroLAKES shapefile",
+)
+class TestPairBasinsWithLakes(unittest.TestCase):
+    """pair_basins_with_lakes() — WATERSHED mode's actual matching logic, pulled out as
+    a pure function specifically so it's testable against a small, synthetic basin set
+    (see its own docstring) rather than needing the real, ~1-hour, country-wide
+    depression-fill (watershed.py) just to check the pairing arithmetic. Uses the real
+    lakes.geojson/HydroLAKES polygons (both already needed elsewhere) so "nearest lake"
+    and the shoreline-exclusion check run against real geography, not a stand-in.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import geopandas as gpd
+        cls.lakes = gpd.read_file(fetch_data.LAKES_OUT_PATH)
+        cls.lake_polygons = load_lake_polygons(fetch_data.fetch_hydrolakes_raw())
+
+    def _basins_gdf(self, rows):
+        import geopandas as gpd
+        return gpd.GeoDataFrame(
+            [{k: v for k, v in r.items() if k != "point"} for r in rows],
+            geometry=[r["point"] for r in rows],
+            crs="EPSG:4326",
+        )
+
+    def test_pairs_a_real_basin_with_the_correct_real_lake(self):
+        # The real Leșu bowl (deepest point, elevation, and pysheds' own real pour-point
+        # volume — see DATA_SOURCES.md, 2026-09-18) as a synthetic one-row catalog. Its
+        # nearest real lake, found from the WHOLE real lakes.geojson (not hand-picked),
+        # must be Leșu itself (id 1352457) -- this is checking real geography, not a
+        # fixture built to already contain the answer.
+        basins = self._basins_gdf([{
+            "elevation_m": 841.0, "pour_point_elevation_m": 841.0 + 42.99,
+            "volume_m3": 9_320_000.0, "area_m2": 542_000.0,
+            "point": Point(22.54605, 46.81261),
+        }])
+        records = pair_basins_with_lakes(basins, self.lakes, self.lake_polygons, (18270885.24, 0.946))
+        self.assertEqual(len(records), 1)
+        r = records[0]
+        self.assertEqual(r["lake_id"], 1352457)
+        self.assertLess(r["distance_m"], WATERSHED_MAX_PAIRING_DISTANCE_M)
+        self.assertAlmostEqual(r["head_m"], head_from_water_levels(841.0 + 42.99, r["lake_elevation_m"]))
+        self.assertEqual(r["mode"], "watershed")
+        self.assertIsNone(r["wall_fraction"])
+        self.assertIsNone(r["dam_line"])
+        self.assertTrue(r["basin_bounded"])
+
+    def test_basin_too_far_from_any_lake_is_dropped(self):
+        # The middle of the Bărăgan Plain — real, flat, agricultural terrain far from
+        # any of the lakes this synthetic basin would otherwise need to be near. Not
+        # about whether a depression is plausible there (it isn't checked here at all),
+        # just that distance filtering actually excludes it.
+        basins = self._basins_gdf([{
+            "elevation_m": 40.0, "pour_point_elevation_m": 45.0,
+            "volume_m3": 1_000_000.0, "area_m2": 100_000.0,
+            "point": Point(27.5, 44.5),
+        }])
+        # Sanity: confirm this point really is far from every real lake before trusting
+        # a 0-result as meaningful rather than a fluke.
+        nearest_m = min(
+            math.hypot((27.5 - lon) * 76_000, (44.5 - lat) * 111_320)
+            for lon, lat in zip(self.lakes.geometry.x, self.lakes.geometry.y)
+        )
+        self.assertGreater(nearest_m, WATERSHED_MAX_PAIRING_DISTANCE_M)
+        records = pair_basins_with_lakes(basins, self.lakes, self.lake_polygons, (18270885.24, 0.946))
+        self.assertEqual(len(records), 0)
+
+    def test_basin_inside_a_lakes_own_shoreline_is_excluded(self):
+        # A "basin" sitting essentially on top of Leșu's own real anchor point -- not a
+        # separate natural depression at all, just the lake itself. Must be excluded by
+        # the same LAKE_EXCLUSION_BUFFER_M reasoning every other mode already uses.
+        lesu = self.lakes[self.lakes["id"] == 1352457].iloc[0]
+        basins = self._basins_gdf([{
+            "elevation_m": float(lesu["elevation"]), "pour_point_elevation_m": float(lesu["elevation"]) + 1.0,
+            "volume_m3": 1_000_000.0, "area_m2": 100_000.0,
+            "point": lesu.geometry,
+        }])
+        records = pair_basins_with_lakes(basins, self.lakes, self.lake_polygons, (18270885.24, 0.946))
+        self.assertEqual(len(records), 0)
+
+
+class TestPairExistingLakes(unittest.TestCase):
+    """pair_existing_lakes() — TWINLAKE mode. Synthetic lakes tables (deterministic, no
+    DEM, no HydroLAKES) for the rules themselves; one real-data invariant test below.
+    The distance rule is the ANU atlas's own "minimum slope 1:20" (see the TWINLAKE
+    config comment in find_sites.py) — head / horizontal separation >= 1/20.
+    """
+
+    EMPIRICAL = (18270885.24, 0.946)
+
+    def _lakes(self, rows):
+        import geopandas as gpd
+        return gpd.GeoDataFrame(
+            [{"id": r["id"], "elevation": r["elev"], "volume_m3": r["vol"], "area_km2": r.get("area", 0.2)}
+             for r in rows],
+            geometry=[Point(r["lon"], r["lat"]) for r in rows],
+            crs="EPSG:4326",
+        )
+
+    def _pair(self, lower_elev, upper_elev, dist_m, lower_vol=5e6, upper_vol=3e6, polygons=None):
+        # Two lakes on the same latitude, dist_m apart east-west, at ~46N.
+        m_per_deg_lon, _ = meters_per_degree(46.0)
+        lakes = self._lakes([
+            {"id": 1, "elev": lower_elev, "vol": lower_vol, "lon": 25.0, "lat": 46.0},
+            {"id": 2, "elev": upper_elev, "vol": upper_vol, "lon": 25.0 + dist_m / m_per_deg_lon, "lat": 46.0},
+        ])
+        return pair_existing_lakes(lakes, polygons or {}, self.EMPIRICAL)
+
+    def test_a_steep_enough_pair_qualifies_with_the_right_numbers(self):
+        # 200m head over 2000m: slope 1:10, comfortably steeper than 1:20.
+        records = self._pair(lower_elev=500, upper_elev=700, dist_m=2000, lower_vol=5e6, upper_vol=3e6)
+        self.assertEqual(len(records), 1)
+        r = records[0]
+        self.assertEqual((r["lake_id"], r["site_lake_id"]), (1, 2))  # lower is the anchor
+        self.assertEqual(r["mode"], "twinlake")
+        self.assertEqual(r["direction"], "higher")
+        self.assertAlmostEqual(r["head_m"], 200.0)
+        self.assertAlmostEqual(r["distance_m"], 2000.0, delta=2.0)
+        # Usable = the SMALLER lake's drawdown, both ends keep their reserve.
+        self.assertAlmostEqual(r["volume_m3"], MAX_LAKE_DRAWDOWN_FRACTION * 3e6)
+        self.assertAlmostEqual(r["basin_volume_m3"], 3e6)  # upper lake's own capacity
+        self.assertEqual(r["water_level_m"], r["site_elevation_m"])  # already water
+        self.assertIsNone(r["dam_line"])
+        self.assertGreater(r["score"], 0)
+
+    def test_order_of_the_two_lakes_does_not_matter(self):
+        # Same pair, upper lake listed first -- must still make the LOWER one the anchor.
+        a = self._pair(lower_elev=500, upper_elev=700, dist_m=2000)[0]
+        b = self._pair(lower_elev=700, upper_elev=500, dist_m=2000)[0]  # ids swap roles
+        self.assertEqual(a["head_m"], b["head_m"])
+        self.assertEqual(b["lake_id"], 2)  # id 2 is now the lower one
+        self.assertEqual(b["site_lake_id"], 1)
+
+    def test_too_flat_a_pair_is_rejected_by_the_slope_rule(self):
+        # 200m head over 5000m: slope 1:25, flatter than ANU's 1:20 -- rejected even
+        # though head alone would pass easily.
+        self.assertEqual(len(self._pair(lower_elev=500, upper_elev=700, dist_m=5000)), 0)
+        # ...and the same head at exactly 20x is the boundary, which must pass.
+        self.assertEqual(len(self._pair(lower_elev=500, upper_elev=700, dist_m=200 / TWINLAKE_MIN_SLOPE - 5)), 1)
+
+    def test_under_min_head_is_rejected(self):
+        self.assertEqual(len(self._pair(lower_elev=500, upper_elev=500 + MIN_HEAD_M - 1, dist_m=500)), 0)
+
+    def test_missing_volume_is_rejected_rather_than_guessed(self):
+        self.assertEqual(len(self._pair(lower_elev=500, upper_elev=700, dist_m=2000, upper_vol=float("nan"))), 0)
+        self.assertEqual(len(self._pair(lower_elev=500, upper_elev=700, dist_m=2000, lower_vol=0.0)), 0)
+
+    def test_touching_polygons_are_one_water_body_not_a_pair(self):
+        from shapely.geometry import box
+        # Overlapping polygons for the two ids -> the pair is dropped.
+        polygons = {1: box(24.99, 45.99, 25.02, 46.01), 2: box(25.01, 45.99, 25.05, 46.01)}
+        self.assertEqual(len(self._pair(lower_elev=500, upper_elev=700, dist_m=2000, polygons=polygons)), 0)
+        # Disjoint polygons keep it.
+        polygons = {1: box(24.99, 45.99, 25.00, 46.01), 2: box(25.02, 45.99, 25.05, 46.01)}
+        self.assertEqual(len(self._pair(lower_elev=500, upper_elev=700, dist_m=2000, polygons=polygons)), 1)
+
+    @unittest.skipUnless(LAKES_AVAILABLE and HYDROLAKES_AVAILABLE, "requires the real lakes data")
+    def test_real_romania_every_pair_satisfies_both_published_criteria(self):
+        # Invariants over the real data, not a pinned count: whatever this returns for
+        # Romania (currently nothing -- see DATA_SOURCES.md, 2026-09-18: 36 pairs clear
+        # 100m of head within 16km, every one flatter than 1:20) must satisfy ANU's two
+        # published rules. A count assertion here would just be overfitting to today's
+        # data; the rules are what must hold.
+        import geopandas as gpd
+        lakes = gpd.read_file(fetch_data.LAKES_OUT_PATH)
+        polygons = load_lake_polygons(fetch_data.fetch_hydrolakes_raw())
+        for r in pair_existing_lakes(lakes, polygons, self.EMPIRICAL):
+            self.assertGreaterEqual(r["head_m"], MIN_HEAD_M)
+            self.assertGreaterEqual(r["head_m"] / r["distance_m"], TWINLAKE_MIN_SLOPE)
+            self.assertNotEqual(r["lake_id"], r["site_lake_id"])
 
 
 if __name__ == "__main__":

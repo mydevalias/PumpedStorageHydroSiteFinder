@@ -11,14 +11,17 @@ actually buildable given the terrain, not just theoretically nearby on a map.
 
 ## What it finds
 
-Every candidate falls into one of three categories, because "build a second
-reservoir" means three genuinely different things depending on the terrain:
+Every candidate falls into one of five categories, because "build a second
+reservoir" means genuinely different things depending on the terrain — and
+sometimes means not building one at all:
 
 | Mode | What it looks for | Real-world precedent |
 |---|---|---|
-| **Natural bowl** | An already-existing depression — no wall needed beyond a modest one | A pre-existing pit or basin |
+| **Natural bowl** | An already-existing depression near a lake — no wall needed beyond a modest one | A pre-existing pit or basin |
 | **Engineered dam** | A valley narrow enough to wall off with a single dam | Most real pumped-storage projects, e.g. Vidraru, Lotru–Ciunget |
 | **Plateau** | Flat high ground diked around its perimeter — no valley or bowl involved | Romania's own planned [Tarnița–Lăpuștești](https://ro.wikipedia.org/wiki/Hidrocentrala_Tarni%C8%9Ba%E2%80%93L%C4%83pu%C8%99te%C8%99ti) project |
+| **Watershed** | Every genuine closed basin in the whole country, found by a real hydrological depression-fill (`pysheds`) rather than by searching around lakes — then paired with the nearest lake | Same physics as a natural bowl, found the way hydrologists find them |
+| **Twin lakes** | Two *existing* lakes with real head between them — nothing new built but the waterway | Cascade reservoirs on one river; selected by the ANU atlas's published rule (head ≥ 100 m, slope ≥ 1:20). **Empty for Romania** — no pair is steep enough, and the map says so rather than hiding the layer |
 
 Each candidate reports estimated power (MW), storage energy (MWh), head,
 distance from the existing lake, a real volume estimate (not a guess — the
@@ -42,6 +45,16 @@ Working, but still v1 and worth reading with that in mind:
   came from checking specific candidates against real satellite imagery and
   finding they didn't hold up. Nothing here is presented as more certain
   than it's been checked to be.
+- **Benchmarked against an independent study** — `scripts/anu_benchmark.py`
+  compares every candidate with the [ANU Global Pumped Hydro Energy Storage
+  Atlas](https://re100.eng.anu.edu.au/global/) (RE100 Group, Australian
+  National University), whose "Bluefield" sites are the same existing-lake +
+  new-reservoir problem. Each popup on the map says whether ANU independently
+  put a reservoir on the same site. The honest result: ANU lists ~940 sites for
+  Romania, mostly 6–35 km from a *large* reservoir with 300–900 m of head; this
+  project searches within 2.5–3 km of *any* lake, so the two overlap only where
+  both looked — within that 3 km, 4 of ANU's 11 sites are also found here.
+  Numbers in `docs/anu_benchmark.json`.
 
 ## How to run it
 
@@ -53,10 +66,17 @@ python3 -m venv .venv
 # 2. Fetch the data (once — cached after that)
 .venv/bin/python scripts/fetch_data.py
 
-# 3. Run the search (fast — re-run anytime you tweak scripts/find_sites.py)
+# 3. (optional, ~1 hour, once) Country-wide depression catalog for the Watershed mode.
+#    Without it, find_sites.py simply skips that mode and says so.
+.venv/bin/python scripts/watershed.py
+
+# 4. Run the search (minutes — re-run anytime you tweak scripts/find_sites.py)
 .venv/bin/python scripts/find_sites.py
 
-# 4. View the map locally
+# 5. (optional) Cross-check against the ANU atlas — fetches their Romania sites once
+.venv/bin/python scripts/anu_benchmark.py
+
+# 6. View the map locally
 cd docs && python3 -m http.server 8934
 # open http://localhost:8934
 ```

@@ -1647,3 +1647,125 @@ adevarul.ro coverage of the Tarnița dam (checked 2026-09-01).
   - NATURAL and PLATEAU's own radii (2500m/3000m) were left as they are — this round
     was specifically about closing ENGINEERED's gap to match, not re-opening an
     already-settled number without new evidence for it.
+
+- **2026-09-18/19 — WATERSHED mode: real country-wide depression-filling (pysheds), a
+  fourth category.** User's pick from a proposal list ("go wild"): replace per-lake
+  heuristics with real hydrology. New `scripts/watershed.py` runs a priority-flood
+  depression-fill (the `pysheds` library — the same class of algorithm GIS/hydrology
+  software uses for watershed delineation) over every DEM tile once, independent of
+  any lake, and takes (filled − original) as the exact volume of every closed
+  depression. `find_sites.py` then pairs each basin with the nearest lake within the
+  same 3000m the other modes use (`pair_basins_with_lakes()`, a pure function with
+  its own tests on synthetic basins against the real lakes table).
+  - **Validated before wiring anything in**: on the tile covering Leșu, pysheds
+    independently rediscovers the natural bowl NATURAL mode found by hand-checking one
+    seed earlier that day — deepest point 22.54611E/46.81250N vs 22.54605/46.81261 (one
+    DEM cell apart), fill depth 42.99m, volume 9.32M m³. That is the real, UNCAPPED
+    pour-point volume; NATURAL's own 12.27M m³ came from a flood capped by its
+    max_dam_height_m=60m budget. In the final pipeline the two modes' sites for lake
+    1352457 are 14m apart (255MW vs 269MW). Locked in as a real-DEM regression test.
+  - Cost: ~1 minute per tile, 63 tiles → over an hour. So it's a separate cached
+    data-prep step (`python scripts/watershed.py` → `data/watershed_basins.geojson`),
+    like fetch_data.py, not something find_sites.py recomputes; find_sites.py skips the
+    mode with a clear message if the file is missing. Dependency pinned
+    (`pysheds==0.5`).
+  - **Real bug found in the first country-wide build, and fixed properly**: 44,766
+    basins, of which 130 were "filled" 400m+ deep — every one a single 682m² cell on
+    the Black Sea coast at 0.2-2m elevation. Cause: Copernicus stores sea as exactly
+    0.0 with no declared nodata; pysheds defaults nodata to 0, so sea cells became
+    impassable walls and a coastal cell got filled against them to the tile's own
+    level (407.5m). Real closed depressions on that same build: p50 depth 5.9m, p99
+    34.5m. Fix in `find_depressions_in_tile()` (hydrological hygiene, not a patch):
+    any basin whose flooded cells touch a sea-level cell OR the raster edge has an
+    unknown outlet and is dropped entirely (this also turns the documented
+    tile-boundary caveat from "reported split" into "not reported"), plus a 1 ha
+    minimum area and a 200m sanity ceiling on fill depth. Four synthetic-tile tests
+    cover each rule (interior bowl kept; edge-touching, sea-adjacent, and
+    single-cell pits dropped). `pair_basins_with_lakes()` applies the same area/depth
+    thresholds as a second line of defence so a stale catalog can't leak them either.
+    Catalog rebuilt with the fix (~1h, background): 44,299 basins (467 removed at
+    the source); on the rebuilt catalog the pairing step's own defensive filter
+    rejects 0 — the two lines of defence agree. Final: 31 paired, 5 displayed,
+    rank 1 = Leșu, unchanged.
+  - Result (first catalog + the defensive filter): of 44,766 depressions only 41 sit
+    within 3km of any lake (42,589 too far, 806 part of a lake's own shoreline, 13
+    rejected as artifacts — the coastal cells above, 4 of which had been on the map as
+    ranks 4-7 with a "407m head"). 31 paired, 5 displayed, rank 1 = Leșu. The
+    honest reading: Romania's real closed basins mostly aren't next to its lakes —
+    which is exactly why the greenfield (two-new-reservoir) idea, pairing basins with
+    each other, is the natural next step and now cheap to build on this catalog.
+  - Map: fifth layer (teal), popup rows for containment ("real hydrological pour
+    point") and construction ("none — the basin's own rim"). No shaded footprint yet:
+    the real shape is the connected component pysheds computed, but keeping every
+    mask country-wide is too much memory and redrawing means re-running the fill per
+    tile; an empty layer is honest, a stand-in circle would not be (this project's own
+    stated rule for footprints).
+
+- **2026-09-19 — TWINLAKE mode: two existing lakes, nothing new built but the
+  waterway.** User's pick ("an afternoon, KD-tree over data we have"). Implemented as
+  `pair_existing_lakes()` (pure function of the lakes table, no DEM; 7 tests on
+  synthetic lakes + a real-data invariant test), a fifth map layer, footprint = the
+  upper lake's real HydroLAKES polygon.
+  - First cut used the other modes' 3000m: 956 pairs within 3km, **max head 37m**;
+    within 5km, 74m. Nothing clears MIN_HEAD_M. Rather than widen until something
+    appeared (the overfitting the user asked to avoid), adopted the field's published
+    criterion instead: the ANU Global Pumped Hydro Atlas selects pairs with "minimum
+    head = 100m ... minimum slope between upper/lower reservoir pairs = 1:20"
+    (re100.eng.anu.edu.au/global, fetched 2026-09-19) — allowed separation scales with
+    head (`TWINLAKE_MIN_SLOPE = 1/20`; search bound 16km = 20 × ANU's 800m max head).
+  - **Result for Romania: zero.** 9,880 lake pairs within 16km; 9,844 under 100m head;
+    the remaining 36 are ALL flatter than 1:20 (best: 241m head at 9.3km = 1:38; the
+    only sizeable one, Vidraru-class lake 170958 ↔ a 0.8M m³ pond, 212m at 6.8km =
+    1:32). ANU's own atlas agrees: its Romania set has just 2 existing-existing pairs,
+    10.3km and 26.8km apart. The layer ships empty and the legend says why — the
+    terrain doesn't offer it, and hiding the mode would hide that finding.
+
+- **2026-09-19 — External benchmark against the ANU Global Pumped Hydro Energy
+  Storage Atlas (Bluefield).** User's pick ("external ground truth, nothing buys more
+  trust as cheaply"). New `scripts/anu_benchmark.py` (+ 8 tests: parser against the
+  real HTML-in-description format, matcher, real-data invariants).
+  - Access: ANU's interactive map is a TerriaMap over a public GeoServer
+    (`re100.anu.edu.au/geoserver/global_bluefield/wfs`), which serves WFS 2.0 GeoJSON
+    — fetched the six Bluefield energy classes for Romania's bbox (bbox must be
+    lon,lat order; lat,lon silently returns nothing), filtered by ANU's own `Country`
+    field. Terms are attribution only ("please acknowledge the RE100 Group,
+    Australian National University"), no formal licence — so raw data stays local and
+    gitignored (`data/anu/`), only our derived comparison is published
+    (`docs/anu_benchmark.json`, acknowledgement in the map legend and popups).
+  - "Bluefield" = one existing reservoir + one new one — the same problem as this
+    project. Each pair is a line + the NEW reservoir's polygon + an HTML table (class
+    A–E, head, separation, slope, volume, energy). Match = our new-site point within
+    1000m of their new-reservoir polygon.
+  - **Romania per ANU: 1,560 pairs, 937 distinct new-reservoir sites, head 100–1452m
+    (median 580m), separation p10/p50/p90 = 6.6 / 13.2 / 25.6 km, max 35 km; built on
+    just 45 existing reservoirs (their ids don't map to HydroLAKES).** Only 11 of the
+    937 sites are within the 3km our modes search. So the two searches ask different
+    questions — ours "what's adjacent to any of 1,100 lakes", theirs "what high ground
+    is within a long tunnel of a big reservoir" — and overlap only where both looked.
+  - Numbers (before WATERSHED/TWINLAKE): of ANU's 11 sites within 3km we find 4 (36%);
+    overall 7/937 (1%), the other 3 via coincidental co-location with a far ANU pair.
+    2–8% of our candidates have an ANU counterpart. Head agreement on matched pairs
+    is loose (median |Δ| 18% natural, 54% plateau) because their new reservoir is a
+    different, class-sized footprint at a different water level, not the same design.
+  - What this actually says: not "we're wrong", but that a fixed 2.5–3km reach is a
+    much tighter assumption than the field standard (ANU's L/H ≤ 20, i.e. up to
+    12–16km for 600–800m of head). That is the single biggest gap between this
+    project and a published study, now measured rather than guessed. Adopting a
+    slope-based reach (as TWINLAKE already does) instead of fixed radii — and
+    restricting long tunnels to the large reservoirs where they pay off, as ANU does —
+    is the obvious next step; deliberately not done in the same change that measured
+    it.
+
+- **2026-09-19 — MIN_HEAD_M was only enforced on a proxy; real bug in every
+  DEM-search mode, caught by the structural audit.** `best_new_site()` and
+  `best_plateau_site()` gated seeds on `head_grid` (bare ground vs lake surface) but
+  never re-checked the REAL head after computing the flooded/diked water level. For a
+  site LOWER than the lake, filling it raises its water surface toward the lake:
+  lake 170958's NATURAL candidate passed at 108m of ground drop and was displayed at
+  99.6MW with 47.8m of real head; lake 1357428 likewise (49.4m). Same family as the
+  2026-09-03 head bug (a proxy leaking into a final figure). Fix: `if head_m <
+  MIN_HEAD_M: continue` right where the water-to-water head is computed, in both
+  functions. Regression test on the real lake 170958 across NATURAL/ENGINEERED/
+  PLATEAU; the audit script now checks `head_m >= 100` on every displayed candidate in
+  every mode. WATERSHED and TWINLAKE were never affected — both gate on the real
+  water levels from the start.

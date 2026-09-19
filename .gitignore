@@ -7,3 +7,6 @@ __pycache__/
 # large re-downloadable raw data
 data/dem/
 data/lakes_raw/
+
+# raw downloads from the ANU pumped hydro atlas (attribution-only terms, not redistributed)
+data/anu/

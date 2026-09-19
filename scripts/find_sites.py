@@ -131,7 +131,8 @@ import rasterio
 from rasterio.merge import merge
 from scipy.ndimage import distance_transform_edt, minimum_filter, uniform_filter
 from rasterio.features import geometry_mask, shapes as rasterio_shapes
-from shapely.geometry import LineString
+from scipy.spatial import cKDTree
+from shapely.geometry import LineString, Point
 from shapely.geometry import shape as shapely_shape
 from shapely.ops import unary_union
 
@@ -141,6 +142,7 @@ from fetch_data import BBOX, DATA_DIR, LAKES_OUT_PATH, dem_tile_path, fetch_hydr
 from volumes import (
     DESIGN_DISCHARGE_HOURS,
     MAX_FLOW_RATE_M3_S,
+    MAX_LAKE_DRAWDOWN_FRACTION,
     basin_volume,
     empirical_reservoir_volume_m3,
     fit_reservoir_area_volume_model,
@@ -235,6 +237,12 @@ TOP_N = {  # 20 -> 100 -> 20 (user's calls, 2026-09-02/03): raised for a broader
     "natural": 50,
     "engineered": 20,
     "plateau": 50,
+    "watershed": 50,  # WATERSHED's own raw pool is large (real depressions found
+                        # independent of any lake, then paired — see run_watershed_mode())
+                        # — same reasoning as NATURAL/PLATEAU's 50, not ENGINEERED's
+                        # tighter 20 (which has a genuinely small raw pool).
+    "twinlake": 50,   # same reasoning — every qualifying pair of existing lakes is a
+                        # candidate, so the raw pool is a pair count, not a lake count.
 }
 MIN_DISPLAY_MW = {  # user's call (2026-09-03): don't show a project this small — a
                      # display-only floor, applied after ranking so it doesn't change
@@ -255,6 +263,15 @@ MIN_DISPLAY_MW = {  # user's call (2026-09-03): don't show a project this small 
     "natural": 10,
     "engineered": 50,
     "plateau": 50,
+    "watershed": 10,  # matches NATURAL's floor, not ENGINEERED/PLATEAU's: a WATERSHED
+                        # candidate's volume/water level come straight from a REAL
+                        # natural pour point (pysheds' fill_depressions — see
+                        # watershed.py), no artificial dam or embankment involved,
+                        # same "no wall/dike cost to justify" economics as NATURAL —
+                        # this mode is really a more rigorous version of that same idea.
+    "twinlake": 10,   # the cheapest category there is — BOTH reservoirs already exist
+                        # (see pair_existing_lakes()), only the waterway/powerhouse is
+                        # new — so the lowest floor of all is the right one.
 }
 MIN_VOLUME_RATIO_TO_LAKE = {  # user's call (2026-09-03): don't show a project unless
                      # the new site's own physical capacity (basin_volume_m3, NOT the
@@ -285,6 +302,10 @@ MIN_VOLUME_RATIO_TO_LAKE = {  # user's call (2026-09-03): don't show a project u
     "natural": 0.0,
     "engineered": 2.0,
     "plateau": 0.0,
+    "watershed": 0.0,  # same reasoning as NATURAL/PLATEAU — no wall/dike cost to justify
+    "twinlake": 0.0,   # nothing is built at all; the ratio of the two lakes' sizes only
+                         # matters through the usable cycling volume (the smaller one's
+                         # drawdown), which already feeds MW directly.
 }
 
 MAX_DAM_LENGTH_M = 300  # 200 -> 300 (user's call, 2026-09-03): raised after asking for
@@ -419,6 +440,71 @@ PLATEAU_SEARCH_WINDOW_RADIUS_M = PLATEAU_SEARCH_RADIUS_M + 400  # same margin-pa
                                   # candidate-cutoff reasoning as SEARCH_WINDOW_RADIUS_M
                                   # above (untruncated neighborhood for the flatness/
                                   # slope checks at a candidate near the radius edge)
+
+# --- WATERSHED mode config ---------------------------------------------------
+# A fourth category, added 2026-09-18 (user: "the algorithm should be smart enough to
+# find that... add one more strategy that algorithmically finds this type of place; do
+# not overfit; there should be more"). Fundamentally different from the other three:
+# NATURAL/ENGINEERED/PLATEAU all start from a LAKE and search its neighborhood for a
+# qualifying site — inherently blind to any real site outside whatever window that one
+# lake's search happens to cover. WATERSHED instead starts from the TERRAIN: a real
+# priority-flood depression-fill (see watershed.py, using the `pysheds` hydrology
+# library) run once, country-wide, independent of any lake, finds every genuine closed
+# basin directly — then each basin is paired with whichever existing lake sits nearest,
+# if one is close enough to be practical. Validated directly against a basin already
+# confirmed real this session: the natural bowl near Leșu (lake 1352457) that NATURAL
+# mode's own search found by hand-checking one specific seed. pysheds independently
+# rediscovers the SAME depression (same deepest point to within one DEM cell) with its
+# own real, uncapped pour-point volume — see watershed.py's module docstring and
+# DATA_SOURCES.md for the full validation.
+WATERSHED_MAX_PAIRING_DISTANCE_M = 3000  # reuses PLATEAU/ENGINEERED's own already-
+                                           # justified 3000m rather than introducing a
+                                           # fourth, freestanding distance constant with
+                                           # no separate grounding of its own — see
+                                           # ENGINEERED's own seed_radius_m comment for
+                                           # why 3000m specifically.
+from watershed import MAX_FILL_DEPTH_M as WATERSHED_MAX_FILL_DEPTH_M  # shared thresholds —
+from watershed import MIN_BASIN_AREA_M2 as WATERSHED_MIN_BASIN_AREA_M2  # see watershed.py
+WATERSHED_BASINS_PATH_NAME = "watershed_basins.geojson"  # written by watershed.py's own
+                                           # main() — a separate, cached data-prep step
+                                           # (like fetch_data.py), not something re-run
+                                           # every time find_sites.py runs: a real
+                                           # depression-fill takes roughly a minute PER
+                                           # DEM TILE (63 tiles for Romania), so a full
+                                           # country run takes over an hour. This mode is
+                                           # silently skipped (with a clear message) if
+                                           # that file doesn't exist yet.
+
+# --- TWINLAKE mode config ----------------------------------------------------
+# A fifth category, added 2026-09-18 (user's pick from a list of proposals): pair two
+# EXISTING lakes that already have real head between them. Nothing new is built except
+# the waterway and powerhouse — no dam, no dike, no new reservoir at all — which makes
+# it the cheapest category on the map by a wide margin, and the only one that needs no
+# DEM search whatsoever: every number comes from HydroLAKES (positions, water-surface
+# elevations via the DEM sample fetch_data.py already takes at each lake, volumes) and
+# a single nearest-pairs query. Real-world precedent for the pattern: cascade
+# reservoirs on one river (Tarnița and Someșul Cald sit on the same Someșul Cald
+# river, a few km and ~100m+ of head apart) are exactly this shape, and several
+# operating pumped-storage plants worldwide connect two pre-existing reservoirs.
+# Usable cycling volume is the SMALLER lake's own MAX_LAKE_DRAWDOWN_FRACTION — both
+# lakes keep their operating reserve, the same 50% rule every other mode applies to
+# its existing lake (see volumes.py), now applied to both ends.
+# Distance rule: NOT the 3000m the other modes use. Checked first (2026-09-18): within
+# 3000m, the largest head between ANY two Romanian lakes is 37m (956 pairs); within
+# 5000m, 74m. Nothing clears MIN_HEAD_M at all. Rather than widen the radius until
+# something appears (exactly the overfitting the user asked to avoid), the cutoff is
+# the field's own published criterion instead — the ANU Global Pumped Hydro Atlas
+# (Blakers et al., re100.eng.anu.edu.au/global) selects reservoir pairs with
+# "minimum head = 100m ... minimum slope between upper/lower reservoir pairs = 1:20":
+# horizontal separation may be at most 20x the head, since in this mode the waterway
+# is the ONLY thing built and its length is the whole cost. That makes the allowed
+# distance scale with head (a 300m head earns a 6km tunnel; a 100m head only 2km)
+# instead of being one fixed number. The search radius below is just the geometric
+# ceiling of that rule at ANU's own 800m maximum head — a bound, not a criterion.
+TWINLAKE_MIN_SLOPE = 1 / 20  # head / horizontal distance, ANU's "1:20" verbatim
+TWINLAKE_MAX_SEARCH_DISTANCE_M = 800 / TWINLAKE_MIN_SLOPE  # 16km — nothing past this
+                                                            # can satisfy 1:20 at any
+                                                            # head ANU considers real
 
 
 @dataclass(frozen=True)
@@ -889,6 +975,14 @@ def best_plateau_site(lake_lon: float, lake_lat: float, lake_elev: float,
         site_elev = float(elev[row, col])
         water_level_m = site_elev + PLATEAU_EMBANKMENT_HEIGHT_M
         head_m = head_from_water_levels(water_level_m, lake_elev)
+        # Real bug (2026-09-19, caught by the structural audit): MIN_HEAD_M was only
+        # enforced on the bare-ground pre-filter above (head_grid). For a site LOWER
+        # than the lake, flooding it raises its water surface TOWARD the lake, so a
+        # seed that passed at 108m of ground drop ended up with 48m of real head once
+        # filled 60m deep (lake 170958, NATURAL #6 — 99.6MW shown for a 48m head).
+        # The gate has to be on the real, water-to-water head, here.
+        if head_m < MIN_HEAD_M:
+            continue
         storage_mwh = storage_capacity_mwh(head_m, volume_m3)
         power_mw, implied_flow_m3_s, flow_limited = realistic_power_mw(storage_mwh, head_m, volume_m3)
         if best is None or power_mw > best["score"]:
@@ -1155,6 +1249,14 @@ def best_new_site(lake_lon: float, lake_lat: float, lake_elev: float, lake_volum
         # error). basin_volume() already returns the real, flooded water_level_m above;
         # use that instead of re-reading the seed's own bare elevation.
         head_m = head_from_water_levels(water_level_m, lake_elev)
+        # Real bug (2026-09-19, caught by the structural audit): MIN_HEAD_M was only
+        # enforced on the bare-ground pre-filter above (head_grid). For a site LOWER
+        # than the lake, flooding it raises its water surface TOWARD the lake, so a
+        # seed that passed at 108m of ground drop ended up with 48m of real head once
+        # filled 60m deep (lake 170958, NATURAL #6 — 99.6MW shown for a 48m head).
+        # The gate has to be on the real, water-to-water head, here.
+        if head_m < MIN_HEAD_M:
+            continue
         storage_mwh = storage_capacity_mwh(head_m, volume_m3)
         power_mw, implied_flow_m3_s, flow_limited = realistic_power_mw(storage_mwh, head_m, volume_m3)
         if best is None or power_mw > best["score"]:
@@ -1365,6 +1467,299 @@ def run_plateau_mode(lakes: gpd.GeoDataFrame, empirical_model: tuple[float, floa
     return records
 
 
+def pair_basins_with_lakes(basins: gpd.GeoDataFrame, lakes: gpd.GeoDataFrame,
+                            lake_polygons: dict, empirical_model: tuple[float, float]) -> list[dict]:
+    """The actual WATERSHED matching logic, pulled out as its own pure function
+    (takes an already-loaded basins GeoDataFrame, not a path) specifically so it's
+    directly testable against a small, synthetic basin set — without needing the real,
+    ~1-hour, country-wide catalog build (see watershed.py) just to check the pairing
+    arithmetic itself. run_watershed_mode() is the thin I/O wrapper around this.
+
+    Basin-first, not lake-first (see the module-level WATERSHED config comment for
+    why). Pairs each real basin with whichever lake sits nearest, within
+    WATERSHED_MAX_PAIRING_DISTANCE_M. Unlike the other three modes, a single lake can
+    legitimately pair with more than one basin (several real depressions can sit near
+    the same lake) — ranking/TOP_N/display filters sort out what's actually shown, the
+    same as everywhere else.
+    """
+    empirical_a, empirical_b = empirical_model
+
+    # A simple flat-earth (equirectangular) approximation centered on the lakes'
+    # own mean latitude — adequate at Romania's scale (the same approximation
+    # meters_per_degree() already makes everywhere else in this module), not meant to
+    # be geodesically precise. cKDTree gives an O(n log n) nearest-lake lookup instead
+    # of an O(basins x lakes) double loop, since a real country-wide basin catalog
+    # (thousands of depressions) makes the naive version genuinely slow.
+    ref_lat = float(lakes.geometry.y.mean())
+    m_per_deg_lon, m_per_deg_lat = meters_per_degree(ref_lat)
+    lake_xy = np.column_stack([
+        lakes.geometry.x.values * m_per_deg_lon, lakes.geometry.y.values * m_per_deg_lat,
+    ])
+    tree = cKDTree(lake_xy)
+    basin_xy = np.column_stack([
+        basins.geometry.x.values * m_per_deg_lon, basins.geometry.y.values * m_per_deg_lat,
+    ])
+    nearest_dist_m, nearest_lake_idx = tree.query(basin_xy, k=1)
+
+    records = []
+    skipped_within_lake = 0
+    skipped_too_far = 0
+    skipped_artifact = 0
+    for i in range(len(basins)):
+        dist_m = float(nearest_dist_m[i])
+        if dist_m > WATERSHED_MAX_PAIRING_DISTANCE_M:
+            skipped_too_far += 1
+            continue
+
+        basin = basins.iloc[i]
+        lake = lakes.iloc[int(nearest_lake_idx[i])]
+        lake_elev = lake["elevation"]
+        if lake_elev is None or (isinstance(lake_elev, float) and math.isnan(lake_elev)):
+            continue
+        lake_volume_m3 = lake["volume_m3"]
+        if lake_volume_m3 is not None and isinstance(lake_volume_m3, float) and math.isnan(lake_volume_m3):
+            lake_volume_m3 = None
+
+        # Same LAKE_EXCLUSION_BUFFER_M reasoning as every other mode — a basin that's
+        # really just part of the lake's own shoreline/footprint, not a separate site.
+        lake_polygon = lake_polygons.get(lake["id"])
+        if lake_polygon is not None:
+            real_dist_deg = lake_polygon.distance(Point(basin.geometry.x, basin.geometry.y))
+            if real_dist_deg * m_per_deg_lon < LAKE_EXCLUSION_BUFFER_M:
+                skipped_within_lake += 1
+                continue
+
+        # Second line of defence against catalog artifacts (the first is in
+        # watershed.py itself): the 2026-09-18 build leaked single-pixel coastal
+        # "basins" filled 400m+ deep against sea-level nodata. Same thresholds as the
+        # catalog's own, so a stale catalog can't put them on the map either.
+        fill_depth_m = basin["pour_point_elevation_m"] - basin["elevation_m"]
+        if basin["area_m2"] < WATERSHED_MIN_BASIN_AREA_M2 or fill_depth_m > WATERSHED_MAX_FILL_DEPTH_M:
+            skipped_artifact += 1
+            continue
+
+        head_m = head_from_water_levels(basin["pour_point_elevation_m"], lake_elev)
+        if head_m < MIN_HEAD_M:
+            continue
+
+        basin_volume_m3 = basin["volume_m3"]
+        volume_m3 = usable_cycling_volume_m3(basin_volume_m3, lake_volume_m3)
+        if volume_m3 < MIN_VOLUME_M3:
+            continue
+
+        storage_mwh = storage_capacity_mwh(head_m, volume_m3)
+        power_mw, implied_flow_m3_s, flow_limited = realistic_power_mw(storage_mwh, head_m, volume_m3)
+
+        records.append({
+            "lake_id": lake["id"],
+            "lake_lon": float(lake.geometry.x),
+            "lake_lat": float(lake.geometry.y),
+            "lake_elevation_m": lake_elev,
+            "mode": "watershed",
+            "site_lon": float(basin.geometry.x),
+            "site_lat": float(basin.geometry.y),
+            "site_elevation_m": basin["elevation_m"],
+            "head_m": head_m,
+            "distance_m": dist_m,
+            "basin_volume_m3": basin_volume_m3,
+            "volume_m3": volume_m3,
+            "lake_volume_m3": lake_volume_m3,
+            "limited_by_existing_lake": (
+                lake_volume_m3 is not None and lake_volume_m3 > 0 and volume_m3 < basin_volume_m3
+            ),
+            "surface_area_m2": basin["area_m2"],
+            "water_level_m": basin["pour_point_elevation_m"],
+            # None for all three: no dam, no dike, no plateau footprint here — the
+            # basin's own real, natural pour point IS the containment (see watershed.py).
+            "wall_fraction": None,
+            "unrealistic_dam_length_m": None,
+            "flat_fraction": None,
+            "storage_mwh": storage_mwh,
+            "implied_flow_m3_s": implied_flow_m3_s,
+            "flow_limited": flow_limited,
+            "score": power_mw,
+            "direction": "higher" if basin["elevation_m"] > lake_elev else "lower",
+            "dam_line": None,
+            "dam_height_m": None,
+            "dam_length_m": None,
+            "concrete_volume_m3": None,
+            # Always True: pysheds' fill_depressions() only ever reports a basin once it
+            # found a real equilibrium pour point (see watershed.py) — unlike the other
+            # modes' basin_volume()/plateau_footprint(), there's no "ran out of height/
+            # radius budget first" case here. The one real caveat (documented, not
+            # fixed): a basin whose true extent crosses a DEM tile boundary gets split
+            # into smaller pieces during the catalog build, so its OWN reported pour
+            # point is still real, just possibly not the full basin's true one.
+            "basin_bounded": True,
+            "empirical_volume_m3": empirical_reservoir_volume_m3(
+                basin["area_m2"] / 1_000_000, empirical_a, empirical_b
+            ),
+        })
+
+    limited = sum(1 for r in records if r["limited_by_existing_lake"])
+    print(f"  {len(records)} basins paired with a lake in range "
+          f"({skipped_too_far} too far from any lake, "
+          f"{skipped_within_lake} skipped as part of the lake's own shoreline, "
+          f"{skipped_artifact} rejected as DEM artifacts (tiny area / implausible depth), "
+          f"{limited} capped by the existing lake's own volume)")
+    records.sort(key=lambda r: r["score"], reverse=True)
+    return records
+
+
+def run_watershed_mode(lakes: gpd.GeoDataFrame, empirical_model: tuple[float, float],
+                        lake_polygons: dict) -> list[dict]:
+    """Thin I/O wrapper: reads the pre-built depression catalog (watershed.py's own
+    cached output, NOT recomputed here — see WATERSHED_BASINS_PATH_NAME's own comment
+    for why) and hands it to pair_basins_with_lakes() for the actual matching logic."""
+    basins_path = DATA_DIR / WATERSHED_BASINS_PATH_NAME
+    if not basins_path.exists():
+        print(f"Skipping WATERSHED mode: {basins_path} not found — run "
+              f"`python scripts/watershed.py` first (a separate, cached, ~1hr step; "
+              f"see watershed.py's module docstring)")
+        return []
+
+    basins = gpd.read_file(basins_path)
+    print(f"Pairing {len(basins)} real natural depressions (from {basins_path.name}) "
+          f"with the nearest existing lake (max {WATERSHED_MAX_PAIRING_DISTANCE_M:.0f}m)...")
+    return pair_basins_with_lakes(basins, lakes, lake_polygons, empirical_model)
+
+
+def _lake_number(value) -> float | None:
+    """HydroLAKES-derived fields arrive as None/NaN when unknown — normalize to None."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    return float(value)
+
+
+def pair_existing_lakes(lakes: gpd.GeoDataFrame, lake_polygons: dict,
+                        empirical_model: tuple[float, float]) -> list[dict]:
+    """TWINLAKE mode (see the module-level TWINLAKE config comment): every unordered
+    pair of existing lakes with at least MIN_HEAD_M of real head between their water
+    surfaces AND a slope (head / horizontal separation) of at least TWINLAKE_MIN_SLOPE
+    — the ANU atlas's own 1:20 criterion, so a bigger head earns a longer allowed
+    waterway. A pure function of the lakes table (no DEM access at all) so it's
+    directly testable on a tiny synthetic lakes GeoDataFrame as well as the real one.
+
+    Record schema matches every other mode's so to_geodataframe()/the map/the display
+    filters work unchanged: the LOWER lake plays the "existing lake" role (lake_id,
+    lake_elevation_m, ...) and the UPPER lake plays the "new site" role (site_lon/lat,
+    site_elevation_m, water_level_m — which for an already-existing lake are the same
+    number, its water surface), plus one extra field, site_lake_id, so the popup can name
+    both lakes. A lake can appear in several pairs; ranking sorts that out as usual.
+    """
+    empirical_a, empirical_b = empirical_model
+
+    ref_lat = float(lakes.geometry.y.mean())
+    m_per_deg_lon, m_per_deg_lat = meters_per_degree(ref_lat)
+    xs = lakes.geometry.x.values * m_per_deg_lon
+    ys = lakes.geometry.y.values * m_per_deg_lat
+    tree = cKDTree(np.column_stack([xs, ys]))
+    pairs = tree.query_pairs(TWINLAKE_MAX_SEARCH_DISTANCE_M)
+
+    records = []
+    skipped_unknown = skipped_low_head = skipped_touching = skipped_slope = 0
+    for i, j in sorted(pairs):
+        a, b = lakes.iloc[i], lakes.iloc[j]
+        a_elev, b_elev = _lake_number(a["elevation"]), _lake_number(b["elevation"])
+        a_vol, b_vol = _lake_number(a["volume_m3"]), _lake_number(b["volume_m3"])
+        if None in (a_elev, b_elev, a_vol, b_vol) or a_vol <= 0 or b_vol <= 0:
+            skipped_unknown += 1  # can't claim a cycling volume without both volumes
+            continue
+
+        if a_elev >= b_elev:
+            upper, lower, upper_elev, lower_elev, upper_vol, lower_vol = a, b, a_elev, b_elev, a_vol, b_vol
+        else:
+            upper, lower, upper_elev, lower_elev, upper_vol, lower_vol = b, a, b_elev, a_elev, b_vol, a_vol
+
+        head_m = head_from_water_levels(upper_elev, lower_elev)
+        if head_m < MIN_HEAD_M:
+            skipped_low_head += 1
+            continue
+
+        dist_m = math.hypot(xs[i] - xs[j], ys[i] - ys[j])
+        if head_m / max(dist_m, 1.0) < TWINLAKE_MIN_SLOPE:
+            skipped_slope += 1  # waterway too long for this much head (ANU's 1:20)
+            continue
+
+        # Two HydroLAKES polygons that actually touch/overlap are one water body split
+        # in the data, not two reservoirs with head between them.
+        upper_poly, lower_poly = lake_polygons.get(upper["id"]), lake_polygons.get(lower["id"])
+        if upper_poly is not None and lower_poly is not None and upper_poly.intersects(lower_poly):
+            skipped_touching += 1
+            continue
+
+        # Both lakes keep their own operating reserve: the cycle can only move what the
+        # SMALLER lake can give up (MAX_LAKE_DRAWDOWN_FRACTION of it) — the same 50% rule
+        # usable_cycling_volume_m3() applies to one existing lake, applied to both ends.
+        basin_volume_m3 = upper_vol  # the upper lake's own physical capacity
+        volume_m3 = MAX_LAKE_DRAWDOWN_FRACTION * min(upper_vol, lower_vol)
+        if volume_m3 < MIN_VOLUME_M3:
+            continue
+
+        storage_mwh = storage_capacity_mwh(head_m, volume_m3)
+        power_mw, implied_flow_m3_s, flow_limited = realistic_power_mw(storage_mwh, head_m, volume_m3)
+        surface_area_m2 = float(upper["area_km2"]) * 1_000_000
+
+        records.append({
+            "lake_id": lower["id"],
+            "lake_lon": float(lower.geometry.x),
+            "lake_lat": float(lower.geometry.y),
+            "lake_elevation_m": lower_elev,
+            "mode": "twinlake",
+            "site_lake_id": upper["id"],
+            "site_lon": float(upper.geometry.x),
+            "site_lat": float(upper.geometry.y),
+            # An existing lake: the DEM already shows its water surface, so ground level
+            # and water level are the same number here (see to_geodataframe()'s notes).
+            "site_elevation_m": upper_elev,
+            "water_level_m": upper_elev,
+            "head_m": head_m,
+            "distance_m": dist_m,
+            "basin_volume_m3": basin_volume_m3,
+            "volume_m3": volume_m3,
+            "lake_volume_m3": lower_vol,
+            "limited_by_existing_lake": volume_m3 < basin_volume_m3,
+            "surface_area_m2": surface_area_m2,
+            "wall_fraction": None,
+            "unrealistic_dam_length_m": None,
+            "flat_fraction": None,
+            "storage_mwh": storage_mwh,
+            "implied_flow_m3_s": implied_flow_m3_s,
+            "flow_limited": flow_limited,
+            "score": power_mw,
+            "direction": "higher",  # by construction: the upper lake is the "site"
+            "dam_line": None,
+            "dam_height_m": None,
+            "dam_length_m": None,
+            "concrete_volume_m3": None,
+            "basin_bounded": True,  # it's a real, existing lake — nothing to search for
+            "empirical_volume_m3": empirical_reservoir_volume_m3(
+                surface_area_m2 / 1_000_000, empirical_a, empirical_b
+            ),
+        })
+
+    print(f"  {len(records)} pairs of existing lakes qualify "
+          f"({len(pairs)} pairs within {TWINLAKE_MAX_SEARCH_DISTANCE_M/1000:.0f}km; "
+          f"{skipped_low_head} under {MIN_HEAD_M}m head, {skipped_slope} flatter than "
+          f"1:{1/TWINLAKE_MIN_SLOPE:.0f} head:distance, {skipped_unknown} missing an "
+          f"elevation/volume, {skipped_touching} touching polygons — one water body)")
+    records.sort(key=lambda r: r["score"], reverse=True)
+    return records
+
+
+def twinlake_footprints_geodataframe(top_candidates: list[dict], lake_polygons: dict) -> gpd.GeoDataFrame:
+    """TWINLAKE's footprint IS the upper lake's real HydroLAKES polygon — no flood to
+    recompute, and no stand-in: the actual mapped shape of the existing water body."""
+    properties, geometries = [], []
+    for rank, r in enumerate(top_candidates, start=1):
+        polygon = lake_polygons.get(r["site_lake_id"])
+        if polygon is None:
+            continue
+        properties.append({"rank": rank, "lake_id": r["lake_id"]})
+        geometries.append(polygon)
+    return gpd.GeoDataFrame(properties, geometry=geometries, crs="EPSG:4326")
+
+
 def to_geodataframe(rows: list[dict]) -> gpd.GeoDataFrame:
     properties = []
     for i, r in enumerate(rows):
@@ -1413,6 +1808,10 @@ def to_geodataframe(rows: list[dict]) -> gpd.GeoDataFrame:
             "flat_fraction": (
                 round(r["flat_fraction"], 3) if r.get("flat_fraction") is not None else None
             ),
+            # Only set by pair_existing_lakes() (TWINLAKE): the UPPER lake's HydroLAKES
+            # id, so the popup can name both ends of the pair. r.get() for the same
+            # reason as flat_fraction above.
+            "site_lake_id": r.get("site_lake_id"),
             "dam_start_lon": round(dam_line[0][0], 6) if dam_line else None,
             "dam_start_lat": round(dam_line[0][1], 6) if dam_line else None,
             "dam_end_lon": round(dam_line[1][0], 6) if dam_line else None,
@@ -1720,6 +2119,107 @@ def main() -> None:
             f"(>={PLATEAU_MIN_FLAT_FRACTION*100:.0f}% required), "
             f"~{r['score']:.0f}MW, {flow_note} "
             f"({r['storage_mwh']:.0f}MWh @ {DESIGN_DISCHARGE_HOURS}h)"
+        )
+    print()
+
+    # WATERSHED isn't a SearchMode either (basin-first, not lake-first — see
+    # run_watershed_mode()'s docstring), and is silently skipped (with a clear message)
+    # if watershed.py's own cached data/watershed_basins.geojson hasn't been built yet.
+    watershed_records = run_watershed_mode(lakes, (empirical_a, empirical_b), lake_polygons)
+
+    all_path = DATA_DIR / "candidates_watershed_all.geojson"
+    to_geodataframe(watershed_records).to_file(all_path, driver="GeoJSON")
+    print(f"  wrote {all_path} ({len(watershed_records)} candidates)")
+
+    watershed_top = [r for r in watershed_records if passes_display_filters(r)][:TOP_N["watershed"]]
+    top_path = docs_dir / "candidates_watershed.geojson"
+    to_geodataframe(watershed_top).to_file(top_path, driver="GeoJSON")
+    print(f"  wrote {top_path} (top {len(watershed_top)})")
+
+    watershed_contours = contours_geodataframe(watershed_top, radius_m=WATERSHED_MAX_PAIRING_DISTANCE_M)
+    contours_path = docs_dir / "contours_watershed.geojson"
+    watershed_contours.to_file(contours_path, driver="GeoJSON")
+    print(f"  wrote {contours_path} ({len(watershed_contours)} contour segments, "
+          f"{CONTOUR_INTERVAL_M}m interval)")
+
+    # No basin_footprints_geodataframe() equivalent yet: the real flooded shape for a
+    # WATERSHED candidate is exactly the connected component pysheds already computed
+    # during the catalog build (see watershed.py) but that mask isn't kept (would be a
+    # lot of memory across a country-wide catalog) — redrawing it here would mean
+    # re-running the ~1-minute-per-tile depression-fill for whichever tile each top
+    # candidate falls in. Left as a known gap rather than faked with a circle (this
+    # project's own stated policy elsewhere — basin footprints are "the real computed
+    # shape, not a placeholder"): an empty layer is honest, a circle would not be.
+    basins_path = docs_dir / "basins_watershed.geojson"
+    gpd.GeoDataFrame({"rank": []}, geometry=[], crs="EPSG:4326").to_file(basins_path, driver="GeoJSON")
+    print(f"  wrote {basins_path} (0 basin footprint(s) — real shape not drawn for this "
+          f"mode yet, see run_watershed_mode()'s docstring)")
+
+    for i, r in enumerate(watershed_top, start=1):
+        lake_vol_note = (
+            f"lake holds {r['lake_volume_m3']/1e6:.1f}Mm3, "
+            f"{'CAPPED to 50% of it' if r['limited_by_existing_lake'] else 'not the limit'}"
+            if r["lake_volume_m3"] else "lake volume unknown, not validated"
+        )
+        flow_note = (
+            f"flow CAPPED to {MAX_FLOW_RATE_M3_S}m3/s (would need {r['implied_flow_m3_s']:.0f}m3/s otherwise)"
+            if r["flow_limited"] else f"flow {r['implied_flow_m3_s']:.0f}m3/s, within realistic range"
+        )
+        print(
+            f"  #{i}: lake {r['lake_id']} -> real natural depression {r['direction']}, "
+            f"head={r['head_m']:.0f}m, distance={r['distance_m']:.0f}m, "
+            f"real pour-point basin holds {r['basin_volume_m3']/1e6:.2f}Mm3 "
+            f"(cross-check predicts {r['empirical_volume_m3']/1e6:.2f}Mm3 for this footprint), "
+            f"usable={r['volume_m3']/1e6:.2f}Mm3 (real natural containment, no dam/dike; {lake_vol_note}), "
+            f"~{r['score']:.0f}MW, {flow_note} "
+            f"({r['storage_mwh']:.0f}MWh @ {DESIGN_DISCHARGE_HOURS}h)"
+        )
+    print()
+
+    # TWINLAKE: two existing lakes, nothing new built but the waterway — no DEM search
+    # at all (see pair_existing_lakes()). Footprint = the upper lake's real polygon.
+    print(f"Pairing {len(lakes)} existing lakes with each other "
+          f"(>= {MIN_HEAD_M}m head, slope >= 1:{1/TWINLAKE_MIN_SLOPE:.0f} — the ANU atlas criterion)...")
+    twinlake_records = pair_existing_lakes(lakes, lake_polygons, (empirical_a, empirical_b))
+
+    all_path = DATA_DIR / "candidates_twinlake_all.geojson"
+    to_geodataframe(twinlake_records).to_file(all_path, driver="GeoJSON")
+    print(f"  wrote {all_path} ({len(twinlake_records)} candidates)")
+
+    twinlake_top = [r for r in twinlake_records if passes_display_filters(r)][:TOP_N["twinlake"]]
+    top_path = docs_dir / "candidates_twinlake.geojson"
+    to_geodataframe(twinlake_top).to_file(top_path, driver="GeoJSON")
+    print(f"  wrote {top_path} (top {len(twinlake_top)})")
+
+    # Contour window sized to the pair's own separation (+ margin), not one fixed
+    # radius — under the 1:20 rule a pair can legitimately be anywhere up to 16km apart.
+    twinlake_contours = contours_geodataframe(
+        twinlake_top,
+        radius_m=max([r["distance_m"] for r in twinlake_top], default=SEARCH_RADIUS_M) + 400,
+    )
+    contours_path = docs_dir / "contours_twinlake.geojson"
+    twinlake_contours.to_file(contours_path, driver="GeoJSON")
+    print(f"  wrote {contours_path} ({len(twinlake_contours)} contour segments, "
+          f"{CONTOUR_INTERVAL_M}m interval)")
+
+    twinlake_basins = twinlake_footprints_geodataframe(twinlake_top, lake_polygons)
+    basins_path = docs_dir / "basins_twinlake.geojson"
+    twinlake_basins.to_file(basins_path, driver="GeoJSON")
+    print(f"  wrote {basins_path} ({len(twinlake_basins)} upper-lake footprint(s), real HydroLAKES polygons)")
+
+    for i, r in enumerate(twinlake_top, start=1):
+        flow_note = (
+            f"flow CAPPED to {MAX_FLOW_RATE_M3_S}m3/s (would need {r['implied_flow_m3_s']:.0f}m3/s otherwise)"
+            if r["flow_limited"] else f"flow {r['implied_flow_m3_s']:.0f}m3/s, within realistic range"
+        )
+        print(
+            f"  #{i}: lower lake {r['lake_id']} ({r['lake_elevation_m']:.0f}m, "
+            f"{r['lake_volume_m3']/1e6:.1f}Mm3) <-> upper lake {r['site_lake_id']} "
+            f"({r['site_elevation_m']:.0f}m, {r['basin_volume_m3']/1e6:.1f}Mm3), "
+            f"head={r['head_m']:.0f}m, distance={r['distance_m']:.0f}m, "
+            f"usable={r['volume_m3']/1e6:.2f}Mm3 ({MAX_LAKE_DRAWDOWN_FRACTION:.0%} of the smaller lake), "
+            f"~{r['score']:.0f}MW, {flow_note} "
+            f"({r['storage_mwh']:.0f}MWh @ {DESIGN_DISCHARGE_HOURS}h) — nothing new to build but the waterway"
         )
     print()
 
