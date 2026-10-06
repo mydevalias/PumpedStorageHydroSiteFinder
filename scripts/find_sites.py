@@ -132,9 +132,10 @@ from rasterio.merge import merge
 from scipy.ndimage import distance_transform_edt, minimum_filter, uniform_filter
 from rasterio.features import geometry_mask, shapes as rasterio_shapes
 from scipy.spatial import cKDTree
+import shapely.affinity
 from shapely.geometry import LineString, Point
 from shapely.geometry import shape as shapely_shape
-from shapely.ops import unary_union
+from shapely.ops import nearest_points, unary_union
 
 from contours import CONTOUR_INTERVAL_M, generate_contours
 from dam_construction import estimate_concrete_volume_m3
@@ -913,13 +914,19 @@ def best_plateau_site(lake_lon: float, lake_lat: float, lake_elev: float,
     grad_y, grad_x = np.gradient(elev_filled, pixel_dy_m, pixel_dx_m)
     slope = np.sqrt(grad_x**2 + grad_y**2)
 
-    head_grid = np.abs(elev - lake_elev)
+    # For a higher plateau, water level rises by PLATEAU_EMBANKMENT_HEIGHT_M above ground elev.
+    # For lower ground, water level rises toward the lake, so potential head is at most (lake_elev - elev).
+    max_potential_head = np.where(
+        elev >= lake_elev,
+        (elev - lake_elev) + PLATEAU_EMBANKMENT_HEIGHT_M,
+        lake_elev - elev,
+    )
 
     base_mask = (
         valid
         & ~within_lake_mask
         & (distance_grid <= PLATEAU_SEARCH_RADIUS_M)
-        & (head_grid >= MIN_HEAD_M)
+        & (max_potential_head >= MIN_HEAD_M)
         & (slope <= PLATEAU_MAX_SLOPE_GRADE)
     )
     # Flat over a real neighborhood, not just the one pixel — the same "check a window,
@@ -944,7 +951,7 @@ def best_plateau_site(lake_lon: float, lake_lat: float, lake_elev: float,
     if not candidate_mask.any():
         return None
 
-    prelim_score = np.where(candidate_mask, head_grid / np.maximum(distance_grid, 1.0), -np.inf)
+    prelim_score = np.where(candidate_mask, max_potential_head / np.maximum(distance_grid, 1.0), -np.inf)
     candidate_rows, candidate_cols = np.where(candidate_mask)
     order = np.argsort(prelim_score[candidate_rows, candidate_cols])[::-1]
     shortlist = list(zip(candidate_rows[order], candidate_cols[order]))[:PLATEAU_MAX_CANDIDATES]
@@ -1524,8 +1531,12 @@ def pair_basins_with_lakes(basins: gpd.GeoDataFrame, lakes: gpd.GeoDataFrame,
         # really just part of the lake's own shoreline/footprint, not a separate site.
         lake_polygon = lake_polygons.get(lake["id"])
         if lake_polygon is not None:
-            real_dist_deg = lake_polygon.distance(Point(basin.geometry.x, basin.geometry.y))
-            if real_dist_deg * m_per_deg_lon < LAKE_EXCLUSION_BUFFER_M:
+            # Scaled equirectangular distance to avoid latitude/longitude metric distortion
+            scaled_poly = shapely.affinity.scale(
+                lake_polygon, xfact=m_per_deg_lon, yfact=m_per_deg_lat, origin=(0, 0)
+            )
+            basin_pt_m = Point(basin.geometry.x * m_per_deg_lon, basin.geometry.y * m_per_deg_lat)
+            if scaled_poly.distance(basin_pt_m) < LAKE_EXCLUSION_BUFFER_M:
                 skipped_within_lake += 1
                 continue
 
@@ -1654,7 +1665,7 @@ def pair_existing_lakes(lakes: gpd.GeoDataFrame, lake_polygons: dict,
     xs = lakes.geometry.x.values * m_per_deg_lon
     ys = lakes.geometry.y.values * m_per_deg_lat
     tree = cKDTree(np.column_stack([xs, ys]))
-    pairs = tree.query_pairs(TWINLAKE_MAX_SEARCH_DISTANCE_M)
+    pairs = tree.query_pairs(TWINLAKE_MAX_SEARCH_DISTANCE_M + 10_000)
 
     records = []
     skipped_unknown = skipped_low_head = skipped_touching = skipped_slope = 0
@@ -1676,16 +1687,29 @@ def pair_existing_lakes(lakes: gpd.GeoDataFrame, lake_polygons: dict,
             skipped_low_head += 1
             continue
 
-        dist_m = math.hypot(xs[i] - xs[j], ys[i] - ys[j])
-        if head_m / max(dist_m, 1.0) < TWINLAKE_MIN_SLOPE:
-            skipped_slope += 1  # waterway too long for this much head (ANU's 1:20)
-            continue
-
         # Two HydroLAKES polygons that actually touch/overlap are one water body split
         # in the data, not two reservoirs with head between them.
         upper_poly, lower_poly = lake_polygons.get(upper["id"]), lake_polygons.get(lower["id"])
-        if upper_poly is not None and lower_poly is not None and upper_poly.intersects(lower_poly):
-            skipped_touching += 1
+        if upper_poly is not None and lower_poly is not None:
+            if upper_poly.intersects(lower_poly):
+                skipped_touching += 1
+                continue
+            poly_u_m = shapely.affinity.scale(upper_poly, xfact=m_per_deg_lon, yfact=m_per_deg_lat, origin=(0, 0))
+            poly_l_m = shapely.affinity.scale(lower_poly, xfact=m_per_deg_lon, yfact=m_per_deg_lat, origin=(0, 0))
+            dist_m = float(poly_u_m.distance(poly_l_m))
+            p_upper, p_lower = nearest_points(upper_poly, lower_poly)
+            site_lon, site_lat = float(p_upper.x), float(p_upper.y)
+            lake_lon, lake_lat = float(p_lower.x), float(p_lower.y)
+        else:
+            dist_m = math.hypot(xs[i] - xs[j], ys[i] - ys[j])
+            site_lon, site_lat = float(upper.geometry.x), float(upper.geometry.y)
+            lake_lon, lake_lat = float(lower.geometry.x), float(lower.geometry.y)
+
+        if dist_m <= 0 or dist_m > TWINLAKE_MAX_SEARCH_DISTANCE_M:
+            continue
+
+        if head_m / max(dist_m, 1.0) < TWINLAKE_MIN_SLOPE:
+            skipped_slope += 1  # waterway too long for this much head (ANU's 1:20)
             continue
 
         # Both lakes keep their own operating reserve: the cycle can only move what the
@@ -1702,13 +1726,13 @@ def pair_existing_lakes(lakes: gpd.GeoDataFrame, lake_polygons: dict,
 
         records.append({
             "lake_id": lower["id"],
-            "lake_lon": float(lower.geometry.x),
-            "lake_lat": float(lower.geometry.y),
+            "lake_lon": lake_lon,
+            "lake_lat": lake_lat,
             "lake_elevation_m": lower_elev,
             "mode": "twinlake",
             "site_lake_id": upper["id"],
-            "site_lon": float(upper.geometry.x),
-            "site_lat": float(upper.geometry.y),
+            "site_lon": site_lon,
+            "site_lat": site_lat,
             # An existing lake: the DEM already shows its water surface, so ground level
             # and water level are the same number here (see to_geodataframe()'s notes).
             "site_elevation_m": upper_elev,
@@ -1794,6 +1818,8 @@ def to_geodataframe(rows: list[dict]) -> gpd.GeoDataFrame:
             "storage_mwh": round(r["storage_mwh"], 1),
             "estimated_mw": round(r["score"], 1),
             "score": round(r["score"], 4),
+            "lh_ratio": round(r["distance_m"] / max(r["head_m"], 1.0), 2),
+            "lh_rank": r.get("lh_rank"),
             "implied_flow_m3_s": round(r["implied_flow_m3_s"], 1),
             "flow_limited": r["flow_limited"],
             "basin_bounded": r["basin_bounded"],
@@ -1991,6 +2017,20 @@ def passes_display_filters(r: dict) -> bool:
     return r["basin_volume_m3"] >= MIN_VOLUME_RATIO_TO_LAKE[mode] * r["lake_volume_m3"]
 
 
+def assign_lh_ranks(records: list[dict], top: list[dict]) -> None:
+    """Computes hydraulic L/H ratio (waterway length to head) and assigns ranking
+    sorted ascending by L/H (rank 1 = lowest/best L/H ratio)."""
+    for r in records:
+        r["lh_ratio"] = round(r["distance_m"] / max(r["head_m"], 1.0), 2)
+    by_lh_all = sorted(range(len(records)), key=lambda idx: records[idx]["lh_ratio"])
+    for rank_0, idx in enumerate(by_lh_all):
+        records[idx]["lh_rank"] = rank_0 + 1
+
+    by_lh_top = sorted(range(len(top)), key=lambda idx: top[idx]["lh_ratio"])
+    for rank_0, idx in enumerate(by_lh_top):
+        top[idx]["lh_rank"] = rank_0 + 1
+
+
 def main() -> None:
     lakes = gpd.read_file(LAKES_OUT_PATH)
     docs_dir = Path(__file__).resolve().parent.parent / "docs"
@@ -2008,12 +2048,13 @@ def main() -> None:
 
     for mode in (NATURAL, ENGINEERED):
         records = run_mode(mode, lakes, (empirical_a, empirical_b), lake_polygons)
+        top = [r.copy() for r in records if passes_display_filters(r)][:TOP_N[mode.name]]
+        assign_lh_ranks(records, top)
 
         all_path = DATA_DIR / f"candidates_{mode.name}_all.geojson"
         to_geodataframe(records).to_file(all_path, driver="GeoJSON")
         print(f"  wrote {all_path} ({len(records)} candidates)")
 
-        top = [r for r in records if passes_display_filters(r)][:TOP_N[mode.name]]
         top_path = docs_dir / f"candidates_{mode.name}.geojson"
         to_geodataframe(top).to_file(top_path, driver="GeoJSON")
         print(f"  wrote {top_path} (top {len(top)})")
@@ -2065,7 +2106,7 @@ def main() -> None:
                 f"basin could hold {r['basin_volume_m3']/1e6:.2f}Mm3 "
                 f"(cross-check predicts {r['empirical_volume_m3']/1e6:.2f}Mm3 for this footprint), "
                 f"usable={r['volume_m3']/1e6:.2f}Mm3 ({confidence}; {lake_vol_note}){wall_note}, "
-                f"~{r['score']:.0f}MW, {flow_note}, {concrete_note} "
+                f"~{r['score']:.0f}MW, L/H={r['lh_ratio']:.1f} (#{r['lh_rank']} by L/H), {flow_note}, {concrete_note} "
                 f"({r['storage_mwh']:.0f}MWh @ {DESIGN_DISCHARGE_HOURS}h)"
             )
         print()
@@ -2074,12 +2115,13 @@ def main() -> None:
     # not in the (NATURAL, ENGINEERED) loop above — same write/print pattern, plateau-
     # specific fields (flat_fraction instead of wall_fraction, no dam/concrete notion).
     plateau_records = run_plateau_mode(lakes, (empirical_a, empirical_b), lake_polygons)
+    plateau_top = [r.copy() for r in plateau_records if passes_display_filters(r)][:TOP_N["plateau"]]
+    assign_lh_ranks(plateau_records, plateau_top)
 
     all_path = DATA_DIR / "candidates_plateau_all.geojson"
     to_geodataframe(plateau_records).to_file(all_path, driver="GeoJSON")
     print(f"  wrote {all_path} ({len(plateau_records)} candidates)")
 
-    plateau_top = [r for r in plateau_records if passes_display_filters(r)][:TOP_N["plateau"]]
     top_path = docs_dir / "candidates_plateau.geojson"
     to_geodataframe(plateau_top).to_file(top_path, driver="GeoJSON")
     print(f"  wrote {top_path} (top {len(plateau_top)})")
@@ -2117,7 +2159,7 @@ def main() -> None:
             f"usable={r['volume_m3']/1e6:.2f}Mm3 at a design {PLATEAU_EMBANKMENT_HEIGHT_M:.0f}m embankment "
             f"({confidence}; {lake_vol_note}), {r['flat_fraction']*100:.0f}% of footprint is genuinely flat "
             f"(>={PLATEAU_MIN_FLAT_FRACTION*100:.0f}% required), "
-            f"~{r['score']:.0f}MW, {flow_note} "
+            f"~{r['score']:.0f}MW, L/H={r['lh_ratio']:.1f} (#{r['lh_rank']} by L/H), {flow_note} "
             f"({r['storage_mwh']:.0f}MWh @ {DESIGN_DISCHARGE_HOURS}h)"
         )
     print()
@@ -2126,12 +2168,13 @@ def main() -> None:
     # run_watershed_mode()'s docstring), and is silently skipped (with a clear message)
     # if watershed.py's own cached data/watershed_basins.geojson hasn't been built yet.
     watershed_records = run_watershed_mode(lakes, (empirical_a, empirical_b), lake_polygons)
+    watershed_top = [r.copy() for r in watershed_records if passes_display_filters(r)][:TOP_N["watershed"]]
+    assign_lh_ranks(watershed_records, watershed_top)
 
     all_path = DATA_DIR / "candidates_watershed_all.geojson"
     to_geodataframe(watershed_records).to_file(all_path, driver="GeoJSON")
     print(f"  wrote {all_path} ({len(watershed_records)} candidates)")
 
-    watershed_top = [r for r in watershed_records if passes_display_filters(r)][:TOP_N["watershed"]]
     top_path = docs_dir / "candidates_watershed.geojson"
     to_geodataframe(watershed_top).to_file(top_path, driver="GeoJSON")
     print(f"  wrote {top_path} (top {len(watershed_top)})")
@@ -2171,7 +2214,7 @@ def main() -> None:
             f"real pour-point basin holds {r['basin_volume_m3']/1e6:.2f}Mm3 "
             f"(cross-check predicts {r['empirical_volume_m3']/1e6:.2f}Mm3 for this footprint), "
             f"usable={r['volume_m3']/1e6:.2f}Mm3 (real natural containment, no dam/dike; {lake_vol_note}), "
-            f"~{r['score']:.0f}MW, {flow_note} "
+            f"~{r['score']:.0f}MW, L/H={r['lh_ratio']:.1f} (#{r['lh_rank']} by L/H), {flow_note} "
             f"({r['storage_mwh']:.0f}MWh @ {DESIGN_DISCHARGE_HOURS}h)"
         )
     print()
@@ -2181,12 +2224,13 @@ def main() -> None:
     print(f"Pairing {len(lakes)} existing lakes with each other "
           f"(>= {MIN_HEAD_M}m head, slope >= 1:{1/TWINLAKE_MIN_SLOPE:.0f} — the ANU atlas criterion)...")
     twinlake_records = pair_existing_lakes(lakes, lake_polygons, (empirical_a, empirical_b))
+    twinlake_top = [r.copy() for r in twinlake_records if passes_display_filters(r)][:TOP_N["twinlake"]]
+    assign_lh_ranks(twinlake_records, twinlake_top)
 
     all_path = DATA_DIR / "candidates_twinlake_all.geojson"
     to_geodataframe(twinlake_records).to_file(all_path, driver="GeoJSON")
     print(f"  wrote {all_path} ({len(twinlake_records)} candidates)")
 
-    twinlake_top = [r for r in twinlake_records if passes_display_filters(r)][:TOP_N["twinlake"]]
     top_path = docs_dir / "candidates_twinlake.geojson"
     to_geodataframe(twinlake_top).to_file(top_path, driver="GeoJSON")
     print(f"  wrote {top_path} (top {len(twinlake_top)})")
@@ -2218,7 +2262,7 @@ def main() -> None:
             f"({r['site_elevation_m']:.0f}m, {r['basin_volume_m3']/1e6:.1f}Mm3), "
             f"head={r['head_m']:.0f}m, distance={r['distance_m']:.0f}m, "
             f"usable={r['volume_m3']/1e6:.2f}Mm3 ({MAX_LAKE_DRAWDOWN_FRACTION:.0%} of the smaller lake), "
-            f"~{r['score']:.0f}MW, {flow_note} "
+            f"~{r['score']:.0f}MW, L/H={r['lh_ratio']:.1f} (#{r['lh_rank']} by L/H), {flow_note} "
             f"({r['storage_mwh']:.0f}MWh @ {DESIGN_DISCHARGE_HOURS}h) — nothing new to build but the waterway"
         )
     print()
