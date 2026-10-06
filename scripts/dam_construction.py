@@ -18,17 +18,24 @@ detailed engineering design that can't be inferred from a DEM alone.
 #   - An EMBANKMENT (earthfill/rockfill) dam — more typical for remote sites where
 #     hauling in concrete is impractical — uses compacted earth/rock as the bulk
 #     material, not concrete, so this estimate doesn't apply to it at all.
-# Treat this as "if this were built as a plain concrete gravity dam", not a real design
-# volume for whatever type actually gets chosen.
+#
+# Valley profile: in natural topography, a dam spans a valley where height tapers from
+# maximum H at the riverbed/thalweg to 0 at both abutments. A uniform rectangular extrusion
+# overestimates concrete volume by ~2-3x (for a pure V-notch valley, the integral of h(x)^2
+# is exactly 1/3 of the prismatic volume; for a typical trapezoidal gorge with a flat floor,
+# the shape factor is ~0.5). We use 0.5 as a realistic trapezoidal valley profile factor.
 GRAVITY_DAM_BASE_TO_HEIGHT_RATIO = 0.75
+VALLEY_SHAPE_FACTOR = 0.5
 
 
-def estimate_concrete_volume_m3(dam_height_m: float, dam_length_m: float) -> float:
-    """Triangular gravity-dam cross-section (base_width = ratio * height), extruded
-    along the dam's length. Both dam_height_m and dam_length_m should be >= 0; returns
-    0 for a non-positive height or length (no dam, nothing to estimate)."""
+def estimate_concrete_volume_m3(dam_height_m: float, dam_length_m: float,
+                                valley_shape_factor: float = VALLEY_SHAPE_FACTOR) -> float:
+    """Gravity dam concrete volume estimate: triangular cross-section (base_width = ratio * height)
+    integrated across a valley profile (valley_shape_factor = 0.5 by default for a realistic
+    trapezoidal gorge; 1.0 for a pure rectangular slot extrusion, ~0.33 for a sharp V-notch).
+    Both dam_height_m and dam_length_m should be >= 0; returns 0 for a non-positive height or length."""
     if dam_height_m <= 0 or dam_length_m <= 0:
         return 0.0
     base_width_m = GRAVITY_DAM_BASE_TO_HEIGHT_RATIO * dam_height_m
     cross_section_area_m2 = 0.5 * base_width_m * dam_height_m
-    return cross_section_area_m2 * dam_length_m
+    return cross_section_area_m2 * dam_length_m * valley_shape_factor

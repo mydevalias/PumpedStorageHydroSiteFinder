@@ -83,6 +83,7 @@ def build() -> gpd.GeoDataFrame:
             "rated_mw": project["rated_mw"],
             "storage_mwh_at_rated_mw": round(storage_mwh, 1),
             "implied_duration_h": round(storage_mwh / project["rated_mw"], 1),
+            "lh_ratio": round(distance_m / max(project["head_m"], 1.0), 2),
             "source": project["source"],
         })
         geometries.append(LineString([

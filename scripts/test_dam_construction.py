@@ -6,15 +6,25 @@ Run from the scripts/ directory:
 
 import unittest
 
-from dam_construction import estimate_concrete_volume_m3, GRAVITY_DAM_BASE_TO_HEIGHT_RATIO
+from dam_construction import (
+    estimate_concrete_volume_m3,
+    GRAVITY_DAM_BASE_TO_HEIGHT_RATIO,
+    VALLEY_SHAPE_FACTOR,
+)
 
 
 class TestEstimateConcreteVolume(unittest.TestCase):
     def test_matches_hand_calc(self):
         # base_width = 0.75 * 100 = 75; cross_section = 0.5 * 75 * 100 = 3750 m^2;
-        # volume = 3750 * 200 = 750,000 m^3.
+        # prismatic extrusion = 3750 * 200 = 750,000 m^3.
+        # With default VALLEY_SHAPE_FACTOR = 0.5 (trapezoidal valley profile): 375,000 m^3.
         self.assertAlmostEqual(
-            estimate_concrete_volume_m3(dam_height_m=100, dam_length_m=200), 750_000
+            estimate_concrete_volume_m3(dam_height_m=100, dam_length_m=200), 375_000
+        )
+        # With valley_shape_factor = 1.0 (pure rectangular extrusion): 750,000 m^3.
+        self.assertAlmostEqual(
+            estimate_concrete_volume_m3(dam_height_m=100, dam_length_m=200, valley_shape_factor=1.0),
+            750_000,
         )
 
     def test_scales_with_length_linearly(self):

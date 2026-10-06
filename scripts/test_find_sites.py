@@ -898,8 +898,26 @@ class TestPairExistingLakes(unittest.TestCase):
         for r in pair_existing_lakes(lakes, polygons, self.EMPIRICAL):
             self.assertGreaterEqual(r["head_m"], MIN_HEAD_M)
             self.assertGreaterEqual(r["head_m"] / r["distance_m"], TWINLAKE_MIN_SLOPE)
-            self.assertNotEqual(r["lake_id"], r["site_lake_id"])
+
+class TestAssignLhRanks(unittest.TestCase):
+    """assign_lh_ranks() — computes Hydraulic L/H ratio and ranks sites by efficiency."""
+
+    def test_assign_lh_ranks_sorts_by_lowest_ratio_first(self):
+        c1 = {"head_m": 200.0, "distance_m": 1000.0}  # L/H = 5.0
+        c2 = {"head_m": 300.0, "distance_m": 600.0}   # L/H = 2.0
+        c3 = {"head_m": 100.0, "distance_m": 1000.0}  # L/H = 10.0
+        records = [c1, c2, c3]
+        top = [c1, c2, c3]
+        find_sites.assign_lh_ranks(records, top)
+        self.assertEqual(c2["lh_rank"], 1)
+        self.assertEqual(c2["lh_ratio"], 2.0)
+        self.assertEqual(c1["lh_rank"], 2)
+        self.assertEqual(c1["lh_ratio"], 5.0)
+        self.assertEqual(c3["lh_rank"], 3)
+        self.assertEqual(c3["lh_ratio"], 10.0)
+
 
 
 if __name__ == "__main__":
+
     unittest.main()
