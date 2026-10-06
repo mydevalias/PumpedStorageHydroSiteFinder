@@ -2022,6 +2022,8 @@ def assign_lh_ranks(records: list[dict], top: list[dict]) -> None:
     sorted ascending by L/H (rank 1 = lowest/best L/H ratio)."""
     for r in records:
         r["lh_ratio"] = round(r["distance_m"] / max(r["head_m"], 1.0), 2)
+    for r in top:
+        r["lh_ratio"] = round(r["distance_m"] / max(r["head_m"], 1.0), 2)
     by_lh_all = sorted(range(len(records)), key=lambda idx: records[idx]["lh_ratio"])
     for rank_0, idx in enumerate(by_lh_all):
         records[idx]["lh_rank"] = rank_0 + 1
