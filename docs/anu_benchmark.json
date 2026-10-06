@@ -1,0 +1,125 @@
+{
+  "attribution": "RE100 Group, Australian National University, http://re100.eng.anu.edu.au (Global Pumped Hydro Energy Storage Atlas, Bluefield)",
+  "match_radius_m": 1000.0,
+  "anu_pairs_in_country": 1560,
+  "anu_unique_new_reservoirs": 936,
+  "anu_head_m": {
+    "min": 100.0,
+    "median": 596.0,
+    "max": 1452.0
+  },
+  "modes": {
+    "natural": {
+      "raw": {
+        "count": 11,
+        "with_anu_counterpart": 1,
+        "fraction_with_anu_counterpart": 0.091
+      },
+      "displayed": {
+        "count": 10,
+        "with_anu_counterpart": 1,
+        "fraction_with_anu_counterpart": 0.1,
+        "median_abs_head_diff_fraction": 0.182
+      }
+    },
+    "engineered": {
+      "raw": {
+        "count": 186,
+        "with_anu_counterpart": 1,
+        "fraction_with_anu_counterpart": 0.005
+      },
+      "displayed": {
+        "count": 2,
+        "with_anu_counterpart": 0,
+        "fraction_with_anu_counterpart": 0.0
+      }
+    },
+    "plateau": {
+      "raw": {
+        "count": 444,
+        "with_anu_counterpart": 6,
+        "fraction_with_anu_counterpart": 0.014
+      },
+      "displayed": {
+        "count": 50,
+        "with_anu_counterpart": 3,
+        "fraction_with_anu_counterpart": 0.06,
+        "median_abs_head_diff_fraction": 0.54
+      }
+    },
+    "watershed": {
+      "raw": {
+        "count": 31,
+        "with_anu_counterpart": 2,
+        "fraction_with_anu_counterpart": 0.065
+      },
+      "displayed": {
+        "count": 5,
+        "with_anu_counterpart": 0,
+        "fraction_with_anu_counterpart": 0.0
+      }
+    },
+    "twinlake": {
+      "raw": {
+        "count": 0,
+        "with_anu_counterpart": 0
+      },
+      "displayed": {
+        "count": 0,
+        "with_anu_counterpart": 0
+      }
+    }
+  },
+  "matched_displayed": [
+    {
+      "mode": "natural",
+      "rank": 1,
+      "lake_id": 1357337,
+      "anu_pair": "n45_e023_RES37528 & RES_1089695",
+      "anu_class": "E",
+      "anu_energy_class": "5gwh_18h",
+      "anu_head_m": 213.0,
+      "our_head_m": 251.8,
+      "anu_volume_gl": 11.3,
+      "our_basin_volume_gl": 6.75
+    },
+    {
+      "mode": "plateau",
+      "rank": 2,
+      "lake_id": 169355,
+      "anu_pair": "n46_e023_RES25953 & RES_143844",
+      "anu_class": "E",
+      "anu_energy_class": "15gwh_18h",
+      "anu_head_m": 433.0,
+      "our_head_m": 537.5,
+      "anu_volume_gl": 17.0,
+      "our_basin_volume_gl": 11.59
+    },
+    {
+      "mode": "plateau",
+      "rank": 5,
+      "lake_id": 169296,
+      "anu_pair": "n46_e022_RES22398 & RES_143785",
+      "anu_class": "D",
+      "anu_energy_class": "15gwh_18h",
+      "anu_head_m": 306.0,
+      "our_head_m": 471.3,
+      "anu_volume_gl": 23.6,
+      "our_basin_volume_gl": 9.457
+    },
+    {
+      "mode": "plateau",
+      "rank": 11,
+      "lake_id": 1354000,
+      "anu_pair": "n46_e025_RES49968 & RES_1086358",
+      "anu_class": "E",
+      "anu_energy_class": "5gwh_18h",
+      "anu_head_m": 117.0,
+      "our_head_m": 209.0,
+      "anu_volume_gl": 19.5,
+      "our_basin_volume_gl": 20.757
+    }
+  ],
+  "anu_reservoirs_recovered_by_any_raw_candidate": 7,
+  "anu_recall_fraction": 0.007
+}

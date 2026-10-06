@@ -38,8 +38,46 @@
   .mw-label .headline { font-weight: 700; font-size: 12px; }
   .mw-label .detail { color: #444; }
   .lake-label { transform: translate(-50%, 65%); }
+  .rank-toggle-control {
+    background: white;
+    padding: 6px 10px;
+    border-radius: 4px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+    font-size: 12px;
+    line-height: 1.4;
+  }
+  .rank-toggle-control .title {
+    font-weight: 600;
+    margin-bottom: 4px;
+    color: #333;
+  }
+  .rank-btn-group {
+    display: inline-flex;
+    border: 1px solid #cbd5e1;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .rank-btn {
+    border: none;
+    background: #f8fafc;
+    padding: 4px 10px;
+    font-size: 11px;
+    cursor: pointer;
+    font-weight: 500;
+    color: #334155;
+    transition: background 0.15s, color 0.15s;
+  }
+  .rank-btn:hover {
+    background: #e2e8f0;
+  }
+  .rank-btn.active {
+    background: #1e40af;
+    color: white;
+    font-weight: 700;
+  }
 </style>
 </head>
+
 <body>
 <div id="map"></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -231,10 +269,18 @@ function popupHtml(p, modeKey, modeLabel, siteLat, siteLon) {
     ? ' (the dam location — not the middle of the new lake, see the shaded shape for that)'
     : '';
 
+  const lhVal = p.lh_ratio != null ? p.lh_ratio : +(p.distance_m / Math.max(p.head_m, 1)).toFixed(1);
+  const lhBadge = lhVal < 5
+    ? '<span style="color:#16a34a;font-weight:600;">Excellent (&lt;5:1)</span>'
+    : lhVal <= 10
+    ? '<span style="color:#d97706;font-weight:600;">Viable (5–10:1)</span>'
+    : '<span style="color:#dc2626;font-weight:600;">Challenging (&gt;10:1)</span>';
+  const lhRankBadge = p.lh_rank != null ? ` &middot; L/H Rank #${p.lh_rank}` : '';
+
   return `
-    <strong>#${p.rank} — ${modeLabel}</strong>
+    <strong>#${p.rank} (${Math.round(p.estimated_mw).toLocaleString()} MW)${lhRankBadge} — ${modeLabel}</strong>
     <table class="popup-table">
-      <tr><td><strong>Est. power</strong></td><td><strong>${Math.round(p.estimated_mw).toLocaleString()} MW</strong></td></tr>
+      <tr><td><strong>Est. power</strong></td><td><strong>${Math.round(p.estimated_mw).toLocaleString()} MW</strong> (Rank #${p.rank})</td></tr>
       <tr><td>Lake ID</td><td>${p.lake_id}</td></tr>
       <tr><td>Existing lake water altitude</td><td>${p.lake_elevation_m} m</td></tr>
       <tr><td>Existing lake volume</td><td>${lakeVolumeRow}</td></tr>
@@ -247,6 +293,7 @@ function popupHtml(p, modeKey, modeLabel, siteLat, siteLon) {
       <tr><td>Direction</td><td>new site is ${p.direction}</td></tr>
       <tr><td>Head</td><td>${p.head_m} m (|new reservoir water level &minus; existing lake water altitude|)</td></tr>
       <tr><td>Distance</td><td>${p.distance_m} m</td></tr>
+      <tr><td>Hydraulic L/H ratio</td><td><strong>${lhVal} : 1</strong>${p.lh_rank ? ` (Rank #${p.lh_rank} by L/H)` : ''} &mdash; ${lhBadge}</td></tr>
       <tr><td>Usable volume</td><td>${usableVolumeRow}</td></tr>
       <tr><td>Basin surface</td><td>${p.surface_area_km2} km&sup2;${isWatershed ? ' (real, from the depression-fill — shaded shape not drawn for this mode yet)' : ' (shaded shape is the real footprint)'}</td></tr>
       <tr><td>Cross-check</td><td>${p.empirical_volume_million_m3} million m&sup3; — independent estimate from real reservoirs' area&rarr;volume (loose floor, not precise)</td></tr>
@@ -298,6 +345,36 @@ const anuPromise = fetch('anu_benchmark.json')
 
 Promise.all([modesPromise, referencePromise, anuPromise]).then(([results, referenceData]) => {
   let anyFeatures = false;
+  const candidateItems = [];
+  let currentRanking = 'power';
+
+  function updateCandidateRankings(rankingMode) {
+    currentRanking = rankingMode;
+    candidateItems.forEach(item => {
+      const p = item.p;
+      const lhRatio = p.lh_ratio != null ? p.lh_ratio : +(p.distance_m / Math.max(p.head_m, 1)).toFixed(1);
+      const isPower = rankingMode === 'power';
+      const effectiveRank = isPower ? p.rank : (p.lh_rank || p.rank);
+      const weight = Math.max(2, 6 - effectiveRank);
+      item.polyline.setStyle({ weight });
+
+      const headlineHtml = isPower
+        ? `#${p.rank} · ${Math.round(p.estimated_mw).toLocaleString()} MW`
+        : `#${p.lh_rank || '—'} · L/H ${lhRatio}:1 (${Math.round(p.estimated_mw).toLocaleString()} MW)`;
+
+      const lhSubtext = isPower
+        ? ` &middot; L/H: ${lhRatio}:1${p.lh_rank ? ` (#${p.lh_rank})` : ''}`
+        : ` &middot; MW rank: #${p.rank}`;
+
+      item.marker.setIcon(L.divIcon({
+        className: 'mw-label',
+        html: `<div class="headline">${headlineHtml}</div>` +
+              `<div class="detail">${item.estimateLine}${lhSubtext}</div>` +
+              item.usableLine,
+        iconSize: null,
+      }));
+    });
+  }
 
   results.forEach(({ mode, data, contourData, basinData }) => {
     const group = L.featureGroup();
@@ -336,7 +413,7 @@ Promise.all([modesPromise, referencePromise, anuPromise]).then(([results, refere
       const midLat = (lakeLat + siteLat) / 2;
       const midLon = (lakeLon + siteLon) / 2;
 
-      L.polyline([[lakeLat, lakeLon], [siteLat, siteLon]], {
+      const polyline = L.polyline([[lakeLat, lakeLon], [siteLat, siteLon]], {
         color: mode.color, weight, opacity: 0.85, dashArray: mode.dash
       }).bindPopup(html).addTo(group);
 
@@ -345,19 +422,28 @@ Promise.all([modesPromise, referencePromise, anuPromise]).then(([results, refere
       // itself is reckoned to hold); volume_million_m3 is that capped by the existing
       // lake's own volume when it's the smaller of the two (see popup for details) —
       // show both when they differ, so the cap is visible without a click.
+      const lhRatio = p.lh_ratio != null ? p.lh_ratio : +(p.distance_m / Math.max(p.head_m, 1)).toFixed(1);
       const estimateLine = `${p.basin_volume_million_m3}M m&sup3; est. &middot; ${Math.round(p.head_m)}m head &middot; ${Math.round(p.distance_m)}m away`;
       const usableLine = p.limited_by_existing_lake
         ? `<div class="detail">&rarr; ${p.volume_million_m3}M m&sup3; usable (lake-limited)</div>`
         : '';
-      L.marker([midLat, midLon], {
+      const marker = L.marker([midLat, midLon], {
         icon: L.divIcon({
           className: 'mw-label',
           html: `<div class="headline">#${p.rank} · ${Math.round(p.estimated_mw).toLocaleString()} MW</div>` +
-                `<div class="detail">${estimateLine}</div>` + usableLine,
+                `<div class="detail">${estimateLine} &middot; L/H: ${lhRatio}:1${p.lh_rank ? ` (#${p.lh_rank})` : ''}</div>` + usableLine,
           iconSize: null,
         }),
         interactive: false,
       }).addTo(group);
+
+      candidateItems.push({
+        polyline,
+        marker,
+        p,
+        estimateLine,
+        usableLine,
+      });
 
       const lakeVolumeText = p.lake_volume_million_m3 != null
         ? `${p.lake_volume_million_m3}M m&sup3;`
@@ -418,6 +504,7 @@ Promise.all([modesPromise, referencePromise, anuPromise]).then(([results, refere
     const [[lakeLon, lakeLat], [siteLon, siteLat]] = f.geometry.coordinates;
     const midLat = (lakeLat + siteLat) / 2;
     const midLon = (lakeLon + siteLon) / 2;
+    const rpLh = rp.lh_ratio != null ? rp.lh_ratio : +(rp.distance_m / Math.max(rp.head_m, 1)).toFixed(1);
 
     const popupHtml = `
       <strong>${rp.name}</strong> — real, published project (${rp.status})
@@ -428,6 +515,7 @@ Promise.all([modesPromise, referencePromise, anuPromise]).then(([results, refere
         <tr><td>New site on Google Maps</td><td>${googleMapsLink(siteLat, siteLon)} (approximate — see source)</td></tr>
         <tr><td>Head</td><td>${rp.head_m} m</td></tr>
         <tr><td>Distance</td><td>${rp.distance_m} m</td></tr>
+        <tr><td>Hydraulic L/H ratio</td><td><strong>${rpLh} : 1</strong> (benchmark)</td></tr>
         <tr><td>Upper reservoir (cycling)</td><td>${rp.volume_million_m3} million m&sup3;</td></tr>
         <tr><td>Lower reservoir (cycling)</td><td>${rp.lake_volume_million_m3} million m&sup3;</td></tr>
         <tr><td>Implied duration</td><td>${rp.implied_duration_h} h (storage energy &divide; rated MW, our formula)</td></tr>
@@ -443,7 +531,7 @@ Promise.all([modesPromise, referencePromise, anuPromise]).then(([results, refere
       icon: L.divIcon({
         className: 'mw-label',
         html: `<div class="headline">REAL: ${rp.rated_mw.toLocaleString()} MW</div>` +
-              `<div class="detail">${rp.volume_million_m3}M m&sup3; &middot; ${rp.head_m}m head &middot; ${rp.status}</div>`,
+              `<div class="detail">${rp.volume_million_m3}M m&sup3; &middot; ${rp.head_m}m head &middot; L/H: ${rpLh}:1</div>`,
         iconSize: null,
       }),
       interactive: false,
@@ -463,6 +551,36 @@ Promise.all([modesPromise, referencePromise, anuPromise]).then(([results, refere
   if ((referenceData.features || []).length > 0) {
     overlays[`Real project (reference, ${referenceData.features.length})`] = referenceGroup;
   }
+
+  // Rank switcher control
+  const rankControl = L.control({ position: 'topleft' });
+  rankControl.onAdd = () => {
+    const div = L.DomUtil.create('div', 'rank-toggle-control');
+    L.DomEvent.disableClickPropagation(div);
+    div.innerHTML = `
+      <div class="title">Rank Candidates By</div>
+      <div class="rank-btn-group">
+        <button id="rank-power-btn" class="rank-btn active" title="Rank by total estimated electrical power capacity (MW)">Power (MW)</button>
+        <button id="rank-lh-btn" class="rank-btn" title="Rank by hydraulic efficiency: length-to-head ratio (L/H, lower is better)">Hydraulic L/H</button>
+      </div>
+    `;
+    const powerBtn = div.querySelector('#rank-power-btn');
+    const lhBtn = div.querySelector('#rank-lh-btn');
+    powerBtn.onclick = () => {
+      if (currentRanking === 'power') return;
+      powerBtn.classList.add('active');
+      lhBtn.classList.remove('active');
+      updateCandidateRankings('power');
+    };
+    lhBtn.onclick = () => {
+      if (currentRanking === 'lh') return;
+      lhBtn.classList.add('active');
+      powerBtn.classList.remove('active');
+      updateCandidateRankings('lh');
+    };
+    return div;
+  };
+  rankControl.addTo(map);
 
   if (!anyFeatures) {
     document.getElementById('map').insertAdjacentHTML(
@@ -503,7 +621,9 @@ Promise.all([modesPromise, referencePromise, anuPromise]).then(([results, refere
         <p><strong>Plateau</strong>: flat high ground diked around its perimeter, the way the real Lăpuștești upper reservoir actually is (green benchmark on this map) — no natural depression or valley wall involved, gated by how much of the footprint is genuinely flat (see popup).</p>
         <p><strong>Watershed</strong>: starts from the terrain, not the lake — a real hydrological depression-fill finds every genuine natural basin in the whole country directly, then pairs each with the nearest real lake. No dam or dike at all; the basin's own natural rim is the containment. Its shaded footprint isn't drawn yet (see popup) — everything else about it is real.</p>
         <p><strong>Twin lakes</strong>: two <em>existing</em> lakes with real head between them — nothing new is built but the waterway, the cheapest category possible. Selected by the ANU Global Pumped Hydro Atlas's own published rule (head &ge; 100 m, slope &ge; 1:20). For Romania this layer is currently <strong>empty</strong>: 36 lake pairs clear 100 m of head within 16 km, but every one is flatter than 1:20 (best is 1:38) — the terrain simply doesn't offer it. The layer stays so that's visible rather than hidden.</p>
-        <p>Mid-line label: rank, estimated MW (flow capped at ${MAX_FLOW_RATE_M3_S} m&sup3;/s, a real single-project ceiling), the site's own volume estimate, head, distance — plus a second line if the existing lake caps the usable volume below that. Small label under each lake: its own volume (HydroLAKES) — at most half of that can be cycled per day (see popup), not the whole lake.</p>
+        <p>Mid-line label: rank, estimated MW (flow capped at ${MAX_FLOW_RATE_M3_S} m&sup3;/s, a real single-project ceiling), the site's own volume estimate, head, distance, and hydraulic L/H ratio (length-to-head). Use the ranking toggle at the top-left to switch between Power (MW) and Hydraulic L/H efficiency rankings.</p>
+        <p><strong>Hydraulic L/H ratio</strong>: tunnel length per meter of head. Industry guidelines consider L/H &lt; 5 excellent, 5–10 viable/typical, and &gt; 10 challenging due to waterway friction and surge requirements.</p>
+
         ${ANU.summary ? `<p><strong>External benchmark</strong>: each popup says whether the <a href="https://re100.eng.anu.edu.au/global/" target="_blank" rel="noopener">ANU Global Pumped Hydro Atlas</a> (RE100 Group, Australian National University — acknowledged with thanks) independently placed a reservoir on the same site. ANU lists ${ANU.summary.anu_unique_new_reservoirs} sites for Romania, mostly 6–35 km from a large reservoir with 300–900 m of head; this map searches within 2.5–3 km of any lake, so the two overlap only where both looked (see <code>anu_benchmark.json</code> for the full numbers).</p>` : ''}
       </details>
     `;
